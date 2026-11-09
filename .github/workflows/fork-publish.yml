@@ -1,0 +1,117 @@
+name: Fork publish
+
+# Publishes the version on downstream to crates.io as vsh-serde-saphyr, then
+# tags it and opens the GitHub Release. The version and FORK-CHANGELOG.md
+# change inside the fork-tooling patch, so no Version PR runs first. Only a
+# run started by hand can publish, and its dry-run input defaults to true.
+#
+# A push to downstream that changes the changelog or this file runs a dry run
+# only. A dispatch through the CLI or API on a branch other than the default
+# branch works only after the workflow has run at least once.
+#
+# verctl publishes only at a version commit: the newest commit on HEAD's
+# first-parent history where the crate version became the version at HEAD.
+# forkctl publishes downstream as a merge whose first parent is the patch
+# stack, so the version commit is the fork-tooling commit below that merge.
+# The plan job reads it from `verctl publish --plan`, and the publish job
+# checks it out, as verctl's own release workflow does.
+on:
+  push:
+    branches: [downstream]
+    paths:
+      - FORK-CHANGELOG.md
+      - .github/workflows/fork-publish.yml
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: Preview only. Set to false to publish.
+        type: boolean
+        default: true
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  MISE_ENV: release
+  # The repository's default branch is master, which carries upstream.
+  VERCTL_DEFAULT_BRANCH: downstream
+
+concurrency:
+  group: fork-publish
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan the release
+    if: github.ref == 'refs/heads/downstream'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      commits: ${{ steps.plan.outputs.commits }}
+      pending: ${{ steps.plan.outputs.pending }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install locked toolchain
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          version: 2026.11.2
+          install: false
+          cache: true
+          cache_save: false
+      - run: mise install --locked
+      # Lists every version commit whose release is incomplete, oldest
+      # first, as `commits` and `pending` in $GITHUB_OUTPUT.
+      - name: Plan
+        id: plan
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          VERCTL_PLAN: "true"
+        run: verctl publish
+
+  publish:
+    name: Publish ${{ matrix.commit }}
+    needs: plan
+    if: needs.plan.outputs.pending == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write # crates.io trusted publishing
+    strategy:
+      max-parallel: 1
+      matrix:
+        commit: ${{ fromJson(needs.plan.outputs.commits) }}
+    steps:
+      - name: Check out the version commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ matrix.commit }}
+          fetch-depth: 0
+      - name: Install locked toolchain
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          version: 2026.11.2
+          install: false
+          cache: true
+          cache_save: false
+      - run: mise install --locked
+      # Trusted publishing: crates.io exchanges this job's OIDC token for a
+      # short-lived publish token, which the action revokes when the job ends.
+      # Only a dispatch gets one; on any other event the step is skipped and
+      # the token stays empty.
+      - name: Authenticate to crates.io
+        id: crates-io
+        if: github.event_name == 'workflow_dispatch'
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+      - name: Publish
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io.outputs.token }}
+          # Every event other than a dispatch is a dry run, whatever the input.
+          VERCTL_DRY_RUN: ${{ github.event_name != 'workflow_dispatch' || inputs.dry-run }}
+        run: verctl publish
