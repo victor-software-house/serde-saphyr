@@ -1,0 +1,1899 @@
+public-scalars
+
+From: Victor Araújo <victor@victor-software-house.com>
+
+Downstream-Reason: Make the YAML 1.2 scalar rules the deserializer applies callable by users of the located reader: whether a scalar is null, its bool, its integer at a named width, its float, and what deserialize_any would visit. The deserializer calls the same functions, so the rules keep one home.
+Upstream-Status: not-submitted
+Drop-When: Upstream serde-saphyr exposes its scalar resolution.
+---
+ src/de/deserializer.rs             |  351 +++++-----------------
+ src/de/mod.rs                      |    2 
+ src/de/scalars.rs                  |  573 ++++++++++++++++++++++++++++++++++++
+ src/de/tags.rs                     |   13 +
+ src/lib.rs                         |    2 
+ tests/fixtures/public_scalars.json |  282 ++++++++++++++++++
+ tests/public_scalars.rs            |  458 +++++++++++++++++++++++++++++
+ 7 files changed, 1407 insertions(+), 274 deletions(-)
+ create mode 100644 src/de/scalars.rs
+ create mode 100644 tests/fixtures/public_scalars.json
+ create mode 100644 tests/public_scalars.rs
+
+diff --git a/src/de/deserializer.rs b/src/de/deserializer.rs
+index bfebd8518dd06c962f7e68d0aba61f7a1d9bdf8e..0405178c2a388385c4d3d58b1c811a579635ba04 100644
+--- a/src/de/deserializer.rs
++++ b/src/de/deserializer.rs
+@@ -21,7 +21,7 @@ use super::key_nodes::{
+ };
+ #[cfg(feature = "properties")]
+ use super::options::PropertySyntax;
+-use super::options::{DuplicateKeyPolicy, MergeKeyPolicy, NonFiniteFloatPolicy};
++use super::options::{DuplicateKeyPolicy, MergeKeyPolicy};
+ #[cfg(any(feature = "garde", feature = "validator"))]
+ use super::path_map::PathRecorder;
+ #[cfg(feature = "properties")]
+@@ -29,6 +29,7 @@ use super::properties::{interpolate_compose_style_with_limits, is_sole_unset_ref
+ use super::properties_redaction::{
+     ScalarRedactionCtx, ScalarRedactionGuard, with_interp_redaction_scope,
+ };
++use super::scalars::{self, Inferred, Plan, TextRefusal};
+ use super::spanned_deser;
+ use super::tagged_deser;
+ use super::tags::SfTag;
+@@ -40,11 +41,7 @@ use crate::de_error::budget_error;
+ use crate::location::Location;
+ #[cfg(any(feature = "garde", feature = "validator"))]
+ use crate::location::Locations;
+-use crate::parse_scalars::{
+-    leading_zero_decimal, maybe_not_string, parse_int_signed, parse_int_unsigned,
+-    parse_yaml11_bool, parse_yaml12_bool, parse_yaml12_float, scalar_is_null, scalar_is_nullish,
+-    try_parse_float_incl_overflow, yaml_trim,
+-};
++use crate::parse_scalars::{maybe_not_string, scalar_is_null, scalar_is_nullish};
+ 
+ struct TupleLenExpected {
+     len: usize,
+@@ -450,26 +447,7 @@ impl<'de, 'e> YamlDeserializer<'de, 'e> {
+         ty: &'static str,
+         location: Location,
+     ) -> Result<(), Error> {
+-        let compatible = tag == expected
+-            || match tag {
+-                SfTag::None
+-                | SfTag::Other
+-                | SfTag::Include
+-                | SfTag::Merge
+-                | SfTag::Value
+-                | SfTag::NonSpecific => true,
+-                tag if tag.is_robotics() => {
+-                    expected == SfTag::Float
+-                        && cfg!(feature = "robotics")
+-                        && self.cfg.angle_conversions
+-                }
+-                _ => false,
+-            };
+-        if compatible {
+-            Ok(())
+-        } else {
+-            Err(Error::InvalidScalar { ty, location })
+-        }
++        scalars::validate_tag(&self.cfg, tag, expected, ty, location)
+     }
+ 
+     /// Construct a new streaming deserializer over an `Events` source.
+@@ -619,56 +597,7 @@ impl<'de, 'e> YamlDeserializer<'de, 'e> {
+     /// is not valid UTF-8.
+     fn take_string_scalar(&mut self) -> Result<String, Error> {
+         let (value, tag, location) = self.take_scalar_event()?;
+-
+-        // Special-case binary: decode base64 and require valid UTF-8.
+-        if tag == SfTag::Binary && !self.cfg.ignore_binary_tag_for_string {
+-            let data = decode_base64_yaml(&value).map_err(|err| err.with_location(location))?;
+-            let text = String::from_utf8(data).map_err(|_| Error::BinaryNotUtf8 { location })?;
+-            return Ok(text);
+-        }
+-
+-        // For non-binary, ensure the tag allows string deserialization.
+-        if !(tag.can_parse_into_string()
+-            || self.cfg.ignore_binary_tag_for_string && tag == SfTag::Binary)
+-        {
+-            return Err(Error::TaggedScalarCannotDeserializeIntoString { location });
+-        }
+-
+-        Ok(value)
+-    }
+-
+-    /// Deliver a float to a typeless visitor, applying the configured non-finite policy.
+-    fn visit_typeless_float<V: Visitor<'de>>(
+-        &self,
+-        value: f64,
+-        raw: String,
+-        location: Location,
+-        visitor: V,
+-    ) -> Result<V::Value, Error> {
+-        if value.is_finite() {
+-            return visitor.visit_f64(value);
+-        }
+-        match self.cfg.non_finite_float_policy {
+-            NonFiniteFloatPolicy::PassThrough => visitor.visit_f64(value),
+-            // Cfg resolves the compatibility default; an unconfigured policy otherwise
+-            // has the same behavior as Reject.
+-            NonFiniteFloatPolicy::Default | NonFiniteFloatPolicy::Reject => {
+-                Err(Error::NonFiniteFloat {
+-                    value: raw,
+-                    location,
+-                })
+-            }
+-            NonFiniteFloatPolicy::AsString => {
+-                let canonical = if value.is_nan() {
+-                    ".nan"
+-                } else if value.is_sign_negative() {
+-                    "-.inf"
+-                } else {
+-                    ".inf"
+-                };
+-                visitor.visit_string(canonical.to_owned())
+-            }
+-        }
++        scalars::string(&self.cfg, Cow::Owned(value), tag, location).map(Cow::into_owned)
+     }
+ 
+     /// Expect a sequence start and consume it, or error otherwise.
+@@ -945,130 +874,35 @@ impl<'de> de::Deserializer<'de> for YamlDeserializer<'de, '_> {
+             return YamlDeserializer::new(&mut replay, self.cfg).deserialize_map(visitor);
+         }
+ 
+-        if let Some((value, tag, style, location)) = self.peek_effective_scalar()? {
+-            // Explicit scalar types take precedence over implicit null and string inference,
+-            // including for quoted and block scalars buffered by Serde's flatten support.
+-            match tag {
+-                SfTag::Null => {
+-                    let _ = self.take_scalar_event()?;
+-                    return visitor.visit_unit();
+-                }
+-                SfTag::Bool => return self.deserialize_bool(visitor),
+-                SfTag::Int if yaml_trim(&value).starts_with('-') => {
+-                    return self.deserialize_i64(visitor);
+-                }
+-                SfTag::Int => return self.deserialize_u64(visitor),
+-                SfTag::Float | SfTag::Time | SfTag::Degrees | SfTag::Radians => {
+-                    self.validate_scalar_tag(tag, SfTag::Float, "floating point", location)?;
+-                    let view = self.take_scalar_view()?;
+-                    let value = try_parse_float_incl_overflow(
+-                        &view.effective,
+-                        view.location,
+-                        view.tag,
+-                        self.cfg.angle_conversions,
+-                    )
+-                    .ok_or(Error::InvalidScalar {
+-                        ty: "floating point",
+-                        location: view.location,
+-                    })?;
+-                    return self.visit_typeless_float(
+-                        value,
+-                        view.raw.into_owned(),
+-                        view.location,
+-                        visitor,
+-                    );
+-                }
+-                _ => {}
+-            }
+-            let is_plain = matches!(style, ScalarStyle::Plain);
+-            // String tags (!!str and !) preserve null-like text (null, ~, empty).
+-            if scalar_is_null(&tag, &value, &style) {
++        if let Some(first) = self.peek_scalar_view()? {
++            if scalars::precheck(
++                &self.cfg,
++                &first.effective,
++                first.tag,
++                first.style,
++                first.location,
++            )? == Plan::Null
++            {
+                 let _ = self.ev.next()?; // consume
+                 return visitor.visit_unit();
+             }
+-            if !is_plain
+-                || !tag.can_parse_into_string()
+-                || tag == SfTag::Binary
+-                || tag.forces_string()
+-            {
+-                // For string-ish scalars, rely on the parser's own zero-copy capability:
+-                // if the scalar is returned as `Cow::Borrowed`, we can pass it through.
+-                // Otherwise we fall back to owning.
+-                if tag == SfTag::Binary && !self.cfg.ignore_binary_tag_for_string {
+-                    return visitor.visit_string(self.take_string_scalar()?);
+-                }
+-                if !(tag.can_parse_into_string()
+-                    || self.cfg.ignore_binary_tag_for_string && tag == SfTag::Binary)
+-                {
+-                    return Err(Error::TaggedScalarCannotDeserializeIntoString { location });
+-                }
+-
+-                let (cow, _tag2, _location) = self.take_scalar_cow_event()?;
+-                return match cow {
+-                    Cow::Borrowed(b) => visitor.visit_borrowed_str(b),
+-                    Cow::Owned(s) => visitor.visit_string(s),
+-                };
+-            }
+-
+-            // Consume the scalar and attempt typed parses in order: bool -> int -> float.
+-            // Parse the effective value, but keep the raw source text for diagnostics.
+             let view = self.take_scalar_view()?;
+-            let effective = view.effective;
+-            let location = view.location;
+-
+-            // Try booleans.
+-            if self.cfg.strict_booleans {
+-                if let Some(b) = parse_yaml12_bool(&effective) {
+-                    return visitor.visit_bool(b);
+-                }
+-            } else if let Some(b) = parse_yaml11_bool(&effective) {
+-                return visitor.visit_bool(b);
+-            }
+-
+-            let t = yaml_trim(&effective);
+-            // Preserve selected spellings before either numeric parser can consume
+-            // them. Explicit numeric tags have already dispatched above.
+-            if (self.cfg.leading_zero_numbers_as_strings && leading_zero_decimal(t))
+-                || (self.cfg.underscored_numbers_as_strings && t.contains('_'))
+-            {
+-                return match effective {
+-                    Cow::Borrowed(b) => visitor.visit_borrowed_str(b),
+-                    Cow::Owned(s) => visitor.visit_string(s),
+-                };
+-            }
+-
+-            // Try integers: signed if leading '-', else unsigned, using 64-bit visitors.
+-            if t.starts_with('-') {
+-                if (!leading_zero_decimal(t) || self.cfg.legacy_octal_numbers)
+-                    && let Ok(v) =
+-                        parse_int_signed::<i64>(t, "i64", location, self.cfg.legacy_octal_numbers)
+-                {
+-                    return visitor.visit_i64(v);
+-                }
+-            } else {
+-                if let Ok(v) =
+-                    parse_int_unsigned::<u64>(t, "u64", location, self.cfg.legacy_octal_numbers)
+-                {
+-                    return visitor.visit_u64(v);
+-                }
+-            }
+-
+-            // Try float per YAML 1.2 forms, treating an f64-overflowing literal (e.g.
+-            // `1e999`) as non-finite too, so both shapes are handled consistently below.
+-            if let Some(v) = try_parse_float_incl_overflow(
+-                &effective,
+-                location,
++            let inferred = scalars::infer(
++                &self.cfg,
++                view.effective,
++                &view.raw,
+                 view.tag,
+-                self.cfg.angle_conversions,
+-            ) {
+-                return self.visit_typeless_float(v, view.raw.into_owned(), location, visitor);
+-            }
+-
+-            // Fallback: treat as string as-is, preserving zero-copy borrowing when the
+-            // parser handed us a slice of the original input.
+-            return match effective {
+-                Cow::Borrowed(b) => visitor.visit_borrowed_str(b),
+-                Cow::Owned(s) => visitor.visit_string(s),
++                view.style,
++                view.location,
++            )?;
++            return match inferred {
++                Inferred::Null => visitor.visit_unit(),
++                Inferred::Bool(value) => visitor.visit_bool(value),
++                Inferred::Signed(value) => visitor.visit_i64(value),
++                Inferred::Unsigned(value) => visitor.visit_u64(value),
++                Inferred::Float(value) => visitor.visit_f64(value),
++                Inferred::String(Cow::Borrowed(value)) => visitor.visit_borrowed_str(value),
++                Inferred::String(Cow::Owned(value)) => visitor.visit_string(value),
+             };
+         }
+ 
+@@ -1106,108 +940,82 @@ impl<'de> de::Deserializer<'de> for YamlDeserializer<'de, '_> {
+     /// Flow: scalar text → `Visitor::visit_bool`.
+     fn deserialize_bool<V: Visitor<'de>>(mut self, visitor: V) -> Result<V::Value, Self::Error> {
+         let (s, tag, location) = self.take_scalar_cow_event()?;
+-        self.validate_scalar_tag(tag, SfTag::Bool, "boolean", location)?;
+-        let s = s.as_ref();
+-        let b: bool = if self.cfg.strict_booleans {
+-            parse_yaml12_bool(s).ok_or(Error::InvalidBooleanStrict { location })?
+-        } else {
+-            parse_yaml11_bool(s).ok_or(Error::InvalidScalar {
+-                ty: "boolean",
+-                location,
+-            })?
+-        };
++        let b = scalars::boolean(&self.cfg, s.as_ref(), tag, location)?;
+         visitor.visit_bool(b)
+     }
+ 
+     /// Parse a signed 8-bit integer.
+     fn deserialize_i8<V: Visitor<'de>>(mut self, visitor: V) -> Result<V::Value, Self::Error> {
+         let (s, tag, location) = self.take_scalar_cow_event()?;
+-        self.validate_scalar_tag(tag, SfTag::Int, "i8", location)?;
+-        let v: i8 = parse_int_signed(s.as_ref(), "i8", location, self.cfg.legacy_octal_numbers)?;
++        let v: i8 = scalars::signed(&self.cfg, s.as_ref(), tag, "i8", location)?;
+         visitor.visit_i8(v)
+     }
+     /// Parse a signed 16-bit integer.
+     fn deserialize_i16<V: Visitor<'de>>(mut self, visitor: V) -> Result<V::Value, Self::Error> {
+         let (s, tag, location) = self.take_scalar_cow_event()?;
+-        self.validate_scalar_tag(tag, SfTag::Int, "i16", location)?;
+-        let v: i16 = parse_int_signed(s.as_ref(), "i16", location, self.cfg.legacy_octal_numbers)?;
++        let v: i16 = scalars::signed(&self.cfg, s.as_ref(), tag, "i16", location)?;
+         visitor.visit_i16(v)
+     }
+     /// Parse a signed 32-bit integer.
+     fn deserialize_i32<V: Visitor<'de>>(mut self, visitor: V) -> Result<V::Value, Self::Error> {
+         let (s, tag, location) = self.take_scalar_cow_event()?;
+-        self.validate_scalar_tag(tag, SfTag::Int, "i32", location)?;
+-        let v: i32 = parse_int_signed(s.as_ref(), "i32", location, self.cfg.legacy_octal_numbers)?;
++        let v: i32 = scalars::signed(&self.cfg, s.as_ref(), tag, "i32", location)?;
+         visitor.visit_i32(v)
+     }
+     /// Parse a signed 64-bit integer.
+     fn deserialize_i64<V: Visitor<'de>>(mut self, visitor: V) -> Result<V::Value, Self::Error> {
+         let (s, tag, location) = self.take_scalar_cow_event()?;
+-        self.validate_scalar_tag(tag, SfTag::Int, "i64", location)?;
+-        let v: i64 = parse_int_signed(s.as_ref(), "i64", location, self.cfg.legacy_octal_numbers)?;
++        let v: i64 = scalars::signed(&self.cfg, s.as_ref(), tag, "i64", location)?;
+         visitor.visit_i64(v)
+     }
+     /// Parse a signed 128-bit integer.
+     fn deserialize_i128<V: Visitor<'de>>(mut self, visitor: V) -> Result<V::Value, Self::Error> {
+         let (s, tag, location) = self.take_scalar_cow_event()?;
+-        self.validate_scalar_tag(tag, SfTag::Int, "i128", location)?;
+-        let v: i128 =
+-            parse_int_signed(s.as_ref(), "i128", location, self.cfg.legacy_octal_numbers)?;
++        let v: i128 = scalars::signed(&self.cfg, s.as_ref(), tag, "i128", location)?;
+         visitor.visit_i128(v)
+     }
+ 
+     /// Parse an unsigned 8-bit integer.
+     fn deserialize_u8<V: Visitor<'de>>(mut self, visitor: V) -> Result<V::Value, Self::Error> {
+         let (s, tag, location) = self.take_scalar_cow_event()?;
+-        self.validate_scalar_tag(tag, SfTag::Int, "u8", location)?;
+-        let v: u8 = parse_int_unsigned(s.as_ref(), "u8", location, self.cfg.legacy_octal_numbers)?;
++        let v: u8 = scalars::unsigned(&self.cfg, s.as_ref(), tag, "u8", location)?;
+         visitor.visit_u8(v)
+     }
+     /// Parse an unsigned 16-bit integer.
+     fn deserialize_u16<V: Visitor<'de>>(mut self, visitor: V) -> Result<V::Value, Self::Error> {
+         let (s, tag, location) = self.take_scalar_cow_event()?;
+-        self.validate_scalar_tag(tag, SfTag::Int, "u16", location)?;
+-        let v: u16 =
+-            parse_int_unsigned(s.as_ref(), "u16", location, self.cfg.legacy_octal_numbers)?;
++        let v: u16 = scalars::unsigned(&self.cfg, s.as_ref(), tag, "u16", location)?;
+         visitor.visit_u16(v)
+     }
+     /// Parse an unsigned 32-bit integer.
+     fn deserialize_u32<V: Visitor<'de>>(mut self, visitor: V) -> Result<V::Value, Self::Error> {
+         let (s, tag, location) = self.take_scalar_cow_event()?;
+-        self.validate_scalar_tag(tag, SfTag::Int, "u32", location)?;
+-        let v: u32 =
+-            parse_int_unsigned(s.as_ref(), "u32", location, self.cfg.legacy_octal_numbers)?;
++        let v: u32 = scalars::unsigned(&self.cfg, s.as_ref(), tag, "u32", location)?;
+         visitor.visit_u32(v)
+     }
+     /// Parse an unsigned 64-bit integer.
+     fn deserialize_u64<V: Visitor<'de>>(mut self, visitor: V) -> Result<V::Value, Self::Error> {
+         let (s, tag, location) = self.take_scalar_cow_event()?;
+-        self.validate_scalar_tag(tag, SfTag::Int, "u64", location)?;
+-        let v: u64 =
+-            parse_int_unsigned(s.as_ref(), "u64", location, self.cfg.legacy_octal_numbers)?;
++        let v: u64 = scalars::unsigned(&self.cfg, s.as_ref(), tag, "u64", location)?;
+         visitor.visit_u64(v)
+     }
+     /// Parse an unsigned 128-bit integer.
+     fn deserialize_u128<V: Visitor<'de>>(mut self, visitor: V) -> Result<V::Value, Self::Error> {
+         let (s, tag, location) = self.take_scalar_cow_event()?;
+-        self.validate_scalar_tag(tag, SfTag::Int, "u128", location)?;
+-        let v: u128 =
+-            parse_int_unsigned(s.as_ref(), "u128", location, self.cfg.legacy_octal_numbers)?;
++        let v: u128 = scalars::unsigned(&self.cfg, s.as_ref(), tag, "u128", location)?;
+         visitor.visit_u128(v)
+     }
+ 
+     /// Parse a 32-bit float (supports YAML 1.2 `+.inf`, `-.inf`, `.nan`).
+     fn deserialize_f32<V: Visitor<'de>>(mut self, visitor: V) -> Result<V::Value, Self::Error> {
+         let (s, tag, location) = self.take_scalar_cow_event()?;
+-        self.validate_scalar_tag(tag, SfTag::Float, "floating point", location)?;
+-        let v: f32 = parse_yaml12_float(s.as_ref(), location, tag, self.cfg.angle_conversions)?;
++        let v = scalars::float32(&self.cfg, s.as_ref(), tag, location)?;
+         visitor.visit_f32(v)
+     }
+     /// Parse a 64-bit float (supports YAML 1.2 `+.inf`, `-.inf`, `.nan`).
+     fn deserialize_f64<V: Visitor<'de>>(mut self, visitor: V) -> Result<V::Value, Self::Error> {
+         let (s, tag, location) = self.take_scalar_cow_event()?;
+-        self.validate_scalar_tag(tag, SfTag::Float, "floating point", location)?;
+-        let v: f64 = parse_yaml12_float(s.as_ref(), location, tag, self.cfg.angle_conversions)?;
++        let v = scalars::float64(&self.cfg, s.as_ref(), tag, location)?;
+         visitor.visit_f64(v)
+     }
+ 
+@@ -1263,19 +1071,23 @@ impl<'de> de::Deserializer<'de> for YamlDeserializer<'de, '_> {
+             Some(view) => {
+                 // Check for null - not valid for string deserialization. A deliberately
+                 // substituted ${...} that resolved to "" stays a string, not null.
+-                if (view.tag == SfTag::Null
+-                    || (!view.interpolated && scalar_is_nullish(&view.effective, &view.style)))
+-                    && !view.tag.forces_string()
+-                {
+-                    let loc = view.location;
+-                    let _ = self.ev.next()?;
+-                    return Err(Error::NullIntoString { location: loc });
+-                } else if self.cfg.no_schema
+-                    && maybe_not_string(&view.effective, &view.style, self.cfg.strict_booleans)
+-                    && !view.tag.forces_string()
+-                {
+-                    let view = self.take_scalar_view()?;
+-                    return Err(Self::quoting_required_for_scalar(&view));
++                match scalars::text_refusal(
++                    &self.cfg,
++                    view.tag,
++                    &view.effective,
++                    view.style,
++                    view.interpolated,
++                ) {
++                    Some(TextRefusal::Null) => {
++                        let loc = view.location;
++                        let _ = self.ev.next()?;
++                        return Err(Error::NullIntoString { location: loc });
++                    }
++                    Some(TextRefusal::QuotingRequired) => {
++                        let view = self.take_scalar_view()?;
++                        return Err(Self::quoting_required_for_scalar(&view));
++                    }
++                    None => {}
+                 }
+ 
+                 if view.tag == SfTag::Binary && !self.cfg.ignore_binary_tag_for_string {
+@@ -1290,13 +1102,7 @@ impl<'de> de::Deserializer<'de> for YamlDeserializer<'de, '_> {
+                         Err(err) => Err(err),
+                     };
+                 }
+-                if !(view.tag.can_parse_into_string()
+-                    || self.cfg.ignore_binary_tag_for_string && view.tag == SfTag::Binary)
+-                {
+-                    return Err(Error::TaggedScalarCannotDeserializeIntoString {
+-                        location: view.location,
+-                    });
+-                }
++                scalars::check_text_tag(&self.cfg, view.tag, view.location)?;
+ 
+                 view
+             }
+@@ -1349,31 +1155,28 @@ impl<'de> de::Deserializer<'de> for YamlDeserializer<'de, '_> {
+         let view = if let Some(view) = self.peek_scalar_view()? {
+             // If explicitly tagged as null, or plain null-like, this is not a valid String.
+             // A ${...} that the user deliberately substituted to "" is a legitimate string.
+-            if (view.tag == SfTag::Null
+-                || (!view.interpolated && scalar_is_nullish(&view.effective, &view.style)))
+-                && !view.tag.forces_string()
+-            {
+-                // Consume the scalar to anchor the error at the correct location.
+-                let (_value, _tag, location) = self.take_scalar_event()?;
+-                return Err(Error::NullIntoString { location });
+-            } else if self.cfg.no_schema
+-                && maybe_not_string(&view.effective, &view.style, self.cfg.strict_booleans)
+-                && !view.tag.forces_string()
+-            {
++            match scalars::text_refusal(
++                &self.cfg,
++                view.tag,
++                &view.effective,
++                view.style,
++                view.interpolated,
++            ) {
+                 // Consume the scalar to anchor the error at the correct location.
+-                let view = self.take_scalar_view()?;
+-                return Err(Self::quoting_required_for_scalar(&view));
++                Some(TextRefusal::Null) => {
++                    let (_value, _tag, location) = self.take_scalar_event()?;
++                    return Err(Error::NullIntoString { location });
++                }
++                Some(TextRefusal::QuotingRequired) => {
++                    let view = self.take_scalar_view()?;
++                    return Err(Self::quoting_required_for_scalar(&view));
++                }
++                None => {}
+             }
+             if view.tag == SfTag::Binary && !self.cfg.ignore_binary_tag_for_string {
+                 return visitor.visit_string(self.take_string_scalar()?);
+             }
+-            if !(view.tag.can_parse_into_string()
+-                || self.cfg.ignore_binary_tag_for_string && view.tag == SfTag::Binary)
+-            {
+-                return Err(Error::TaggedScalarCannotDeserializeIntoString {
+-                    location: view.location,
+-                });
+-            }
++            scalars::check_text_tag(&self.cfg, view.tag, view.location)?;
+ 
+             view
+         } else {
+diff --git a/src/de/mod.rs b/src/de/mod.rs
+index 4e0939b720d3e01ae2b5e6f8044b93946b2a9da8..1b94921244d140aac1ec47d832c33bd0e0543089 100644
+--- a/src/de/mod.rs
++++ b/src/de/mod.rs
+@@ -62,6 +62,8 @@ pub mod robotics;
+ #[cfg(all(feature = "deserialize", feature = "include_fs"))]
+ pub(crate) mod safe_resolver;
+ #[cfg(feature = "deserialize")]
++pub mod scalars;
++#[cfg(feature = "deserialize")]
+ pub(crate) mod snippet;
+ #[cfg(feature = "deserialize")]
+ pub(crate) mod tags;
+diff --git a/src/de/scalars.rs b/src/de/scalars.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..e409e79b3c374b1639ea811fd38280ff1d363760
+--- /dev/null
++++ b/src/de/scalars.rs
+@@ -0,0 +1,573 @@
++//! The YAML 1.2 scalar rules the deserializer applies, for scalars that something other than the
++//! deserializer holds, such as the nodes [`located::read`](crate::located::read) returns.
++//!
++//! [`Rules`] answers the questions the deserializer asks of a scalar's processed text, style and
++//! tag: whether it is null, which boolean, integer or float it spells at a width the caller
++//! names, and what [`deserialize_any`](serde_core::Deserializer::deserialize_any) would visit.
++//! The deserializer calls the same functions, so an answer here is the answer
++//! [`from_str_with_options`](crate::from_str_with_options) acts on.
++//!
++//! The rules read these [`Options`]: `strict_booleans`, `legacy_octal_numbers`,
++//! `leading_zero_numbers_as_strings`, `underscored_numbers_as_strings`,
++//! `ignore_binary_tag_for_string`, `no_schema`, `non_finite_float_policy` (and the older
++//! `reject_non_finite_typeless_float`), and `angle_conversions`. Property interpolation is a
++//! step of the deserializer that comes before the rules and is not applied here.
++//!
++//! # Example
++//!
++//! ```
++//! use serde_saphyr::granit_parser::ScalarStyle;
++//! use serde_saphyr::scalars::{Inferred, Rules, Scalar};
++//! use serde_saphyr::{Location, Options};
++//!
++//! let rules = Rules::new(&Options::default());
++//! let scalar = Scalar { value: "0x10", style: ScalarStyle::Plain, tag: None };
++//! assert_eq!(rules.infer(&scalar, Location::UNKNOWN)?, Inferred::Unsigned(16));
++//! assert_eq!(rules.signed::<i8>(&scalar, Location::UNKNOWN)?, 16);
++//!
++//! let quoted = Scalar { value: "8", style: ScalarStyle::DoubleQuoted, tag: None };
++//! assert_eq!(rules.infer(&quoted, Location::UNKNOWN)?, Inferred::String("8".into()));
++//! # Ok::<(), serde_saphyr::Error>(())
++//! ```
++
++use std::borrow::Cow;
++use std::fmt;
++
++use granit_parser::ScalarStyle;
++
++use super::base64::decode_base64_yaml;
++use super::cfg::Cfg;
++use super::options::NonFiniteFloatPolicy;
++use super::tags::SfTag;
++use super::{Error, Options};
++use crate::location::Location;
++use crate::parse_scalars::{
++    leading_zero_decimal, maybe_not_string, parse_int_signed, parse_int_unsigned,
++    parse_yaml11_bool, parse_yaml12_bool, parse_yaml12_float, scalar_is_null, scalar_is_nullish,
++    try_parse_float_incl_overflow, yaml_trim,
++};
++
++/// A scalar as the parser delivers it, which is what the rules read.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Scalar<'a> {
++    /// The processed text: escapes, folding and chomping applied.
++    pub value: &'a str,
++    /// How the scalar is written. Only a plain scalar can be null or a number.
++    pub style: ScalarStyle,
++    /// The tag in the spelling [`Tagged`](crate::Tagged) gives: `!override` for a local tag, the
++    /// resolved handle and suffix otherwise, such as `tag:yaml.org,2002:str` for `!!str`.
++    pub tag: Option<&'a str>,
++}
++
++impl Scalar<'_> {
++    fn sf_tag(&self) -> SfTag {
++        SfTag::from_spelling(self.tag)
++    }
++}
++
++/// What [`deserialize_any`](serde_core::Deserializer::deserialize_any) visits for a scalar.
++#[derive(Clone, Debug, PartialEq)]
++pub enum Inferred<'a> {
++    /// A null: `visit_unit`.
++    Null,
++    /// A boolean: `visit_bool`.
++    Bool(bool),
++    /// An integer whose text starts with a minus sign, plain or tagged `!!int`: `visit_i64`. An
++    /// integer without a minus sign is [`Inferred::Unsigned`], tagged `!!int` or not.
++    Signed(i64),
++    /// An integer written without a minus sign: `visit_u64`.
++    Unsigned(u64),
++    /// A float: `visit_f64`.
++    Float(f64),
++    /// Text: `visit_borrowed_str` or `visit_string`. It holds the canonical `.nan`, `.inf` or
++    /// `-.inf` for a non-finite float that [`NonFiniteFloatPolicy::AsString`] turns into text,
++    /// and the decoded text of a `!!binary` scalar.
++    String(Cow<'a, str>),
++}
++
++/// The scalar rules under one set of [`Options`].
++#[derive(Clone, Copy)]
++pub struct Rules {
++    cfg: Cfg,
++}
++
++impl fmt::Debug for Rules {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("Rules").finish_non_exhaustive()
++    }
++}
++
++impl Rules {
++    /// The rules that [`from_str_with_options`](crate::from_str_with_options) applies under
++    /// `options`.
++    #[must_use]
++    pub fn new(options: &Options) -> Self {
++        Self {
++            cfg: Cfg::from_options(options),
++        }
++    }
++
++    /// Whether the scalar is null: an empty, `~`, `null`, `Null` or `NULL` plain scalar, or one
++    /// tagged `!!null`. A scalar with a string tag, such as `!!str`, or a quoted one is not.
++    #[must_use]
++    pub fn is_null(&self, scalar: &Scalar<'_>) -> bool {
++        scalar_is_null(&scalar.sf_tag(), scalar.value, &scalar.style)
++    }
++
++    /// The boolean the scalar spells: `true` and `false` in the three YAML 1.2 Core spellings
++    /// under `strict_booleans`, and the YAML 1.1 spellings, such as `yes` and `off`, otherwise.
++    ///
++    /// # Errors
++    ///
++    /// Returns [`Error::InvalidScalar`] or, under `strict_booleans`, [`Error::InvalidBooleanStrict`]
++    /// at `location` when the text is not a boolean, and [`Error::InvalidScalar`] when the tag is
++    /// not compatible with a boolean.
++    pub fn boolean(&self, scalar: &Scalar<'_>, location: Location) -> Result<bool, Error> {
++        boolean(&self.cfg, scalar.value, scalar.sf_tag(), location)
++    }
++
++    /// The integer the scalar spells, at the width `T` names: decimal, `0x`, `0o` and `0b`, with
++    /// `_` between digits and an optional sign, and `0` before the digits under
++    /// `legacy_octal_numbers`.
++    ///
++    /// # Errors
++    ///
++    /// Returns [`Error::InvalidScalar`] at `location` when the text is not an integer, does not
++    /// fit `T`, or carries a tag that is not compatible with an integer.
++    pub fn signed<T: TryFrom<i128>>(
++        &self,
++        scalar: &Scalar<'_>,
++        location: Location,
++    ) -> Result<T, Error> {
++        signed(
++            &self.cfg,
++            scalar.value,
++            scalar.sf_tag(),
++            std::any::type_name::<T>(),
++            location,
++        )
++    }
++
++    /// The unsigned integer the scalar spells, at the width `T` names, in the spellings of
++    /// [`Self::signed`].
++    ///
++    /// # Errors
++    ///
++    /// Returns [`Error::InvalidScalar`] at `location` when the text is not an unsigned integer,
++    /// does not fit `T`, or carries a tag that is not compatible with an integer.
++    pub fn unsigned<T: TryFrom<u128>>(
++        &self,
++        scalar: &Scalar<'_>,
++        location: Location,
++    ) -> Result<T, Error> {
++        unsigned(
++            &self.cfg,
++            scalar.value,
++            scalar.sf_tag(),
++            std::any::type_name::<T>(),
++            location,
++        )
++    }
++
++    /// The 32-bit float the scalar spells: a decimal or exponent number, `.inf`, `-.inf` and
++    /// `.nan`. Rust's own `inf` and `nan` are text.
++    ///
++    /// # Errors
++    ///
++    /// Returns [`Error::InvalidScalar`] at `location` when the text is not a finite float or one
++    /// of the YAML spellings of infinity and not-a-number, or when the tag is not compatible
++    /// with a float.
++    pub fn float32(&self, scalar: &Scalar<'_>, location: Location) -> Result<f32, Error> {
++        float32(&self.cfg, scalar.value, scalar.sf_tag(), location)
++    }
++
++    /// The 64-bit float the scalar spells, in the spellings of [`Self::float32`].
++    ///
++    /// # Errors
++    ///
++    /// The errors of [`Self::float32`].
++    pub fn float64(&self, scalar: &Scalar<'_>, location: Location) -> Result<f64, Error> {
++        float64(&self.cfg, scalar.value, scalar.sf_tag(), location)
++    }
++
++    /// The text the scalar reads as: what `deserialize_str` and `deserialize_string` visit.
++    /// It borrows from the scalar unless a `!!binary` scalar is decoded, which owns the decoded
++    /// text.
++    ///
++    /// Property interpolation is not applied: the scalar is read as written, so text that a
++    /// `${...}` substitution produced is not exempt from the null rule here as it is in the
++    /// deserializer.
++    ///
++    /// # Errors
++    ///
++    /// Returns [`Error::NullIntoString`] at `location` for a plain null spelling (`~`, `null`,
++    /// `Null`, `NULL` or empty) and for a `!!null` tag, unless the tag is a string tag such as
++    /// `!!str`. Under `no_schema`, returns the quoting-required error for a plain scalar that
++    /// reads as a number, a boolean or a null, unless the tag is a string tag. Returns
++    /// [`Error::TaggedScalarCannotDeserializeIntoString`] for a tag that has no text form, such as
++    /// `!!int`. For a `!!binary` scalar, which is decoded unless `ignore_binary_tag_for_string` is
++    /// set, returns the errors of a payload that is not base64 or not UTF-8.
++    pub fn string<'a>(
++        &self,
++        scalar: &Scalar<'a>,
++        location: Location,
++    ) -> Result<Cow<'a, str>, Error> {
++        let tag = scalar.sf_tag();
++        match text_refusal(&self.cfg, tag, scalar.value, scalar.style, false) {
++            Some(TextRefusal::Null) => return Err(Error::NullIntoString { location }),
++            Some(TextRefusal::QuotingRequired) => {
++                return Err(Error::quoting_required(scalar.value, false).with_location(location));
++            }
++            None => {}
++        }
++        string(&self.cfg, Cow::Borrowed(scalar.value), tag, location)
++    }
++
++    /// What `deserialize_any` visits for the scalar: an explicit tag picks null, boolean, integer
++    /// or float; a plain scalar without one is null, then a boolean, an integer, a float, and
++    /// text otherwise; any other scalar is text.
++    ///
++    /// # Errors
++    ///
++    /// Returns the errors `deserialize_any` returns at `location`: [`Error::InvalidScalar`] for
++    /// text that does not fit its explicit tag, [`Error::NonFiniteFloat`] for a non-finite float
++    /// under a policy that rejects it, [`Error::TaggedScalarCannotDeserializeIntoString`] for a
++    /// tag that has no text form, and the errors of a `!!binary` scalar that is not base64 or
++    /// not UTF-8.
++    pub fn infer<'a>(
++        &self,
++        scalar: &Scalar<'a>,
++        location: Location,
++    ) -> Result<Inferred<'a>, Error> {
++        infer(
++            &self.cfg,
++            Cow::Borrowed(scalar.value),
++            scalar.value,
++            scalar.sf_tag(),
++            scalar.style,
++            location,
++        )
++    }
++}
++
++/// Check an explicit tag against the tag a scalar target expects.
++///
++/// `tag` is the node's resolved tag, `expected` is the target's scalar tag, `ty` names the target
++/// in diagnostics, and `location` identifies the node. Returns an error for incompatible tags or
++/// disabled robotics conversions.
++pub(super) fn validate_tag(
++    cfg: &Cfg,
++    tag: SfTag,
++    expected: SfTag,
++    ty: &'static str,
++    location: Location,
++) -> Result<(), Error> {
++    let compatible = tag == expected
++        || match tag {
++            SfTag::None
++            | SfTag::Other
++            | SfTag::Include
++            | SfTag::Merge
++            | SfTag::Value
++            | SfTag::NonSpecific => true,
++            tag if tag.is_robotics() => {
++                expected == SfTag::Float && cfg!(feature = "robotics") && cfg.angle_conversions
++            }
++            _ => false,
++        };
++    if compatible {
++        Ok(())
++    } else {
++        Err(Error::InvalidScalar { ty, location })
++    }
++}
++
++/// Parse a boolean literal according to `strict_booleans`.
++pub(super) fn boolean(
++    cfg: &Cfg,
++    value: &str,
++    tag: SfTag,
++    location: Location,
++) -> Result<bool, Error> {
++    validate_tag(cfg, tag, SfTag::Bool, "boolean", location)?;
++    if cfg.strict_booleans {
++        parse_yaml12_bool(value).ok_or(Error::InvalidBooleanStrict { location })
++    } else {
++        parse_yaml11_bool(value).ok_or(Error::InvalidScalar {
++            ty: "boolean",
++            location,
++        })
++    }
++}
++
++/// Parse a signed integer of the type `ty` names.
++pub(super) fn signed<T: TryFrom<i128>>(
++    cfg: &Cfg,
++    value: &str,
++    tag: SfTag,
++    ty: &'static str,
++    location: Location,
++) -> Result<T, Error> {
++    validate_tag(cfg, tag, SfTag::Int, ty, location)?;
++    parse_int_signed(value, ty, location, cfg.legacy_octal_numbers)
++}
++
++/// Parse an unsigned integer of the type `ty` names.
++pub(super) fn unsigned<T: TryFrom<u128>>(
++    cfg: &Cfg,
++    value: &str,
++    tag: SfTag,
++    ty: &'static str,
++    location: Location,
++) -> Result<T, Error> {
++    validate_tag(cfg, tag, SfTag::Int, ty, location)?;
++    parse_int_unsigned(value, ty, location, cfg.legacy_octal_numbers)
++}
++
++/// Parse a 32-bit float (supports YAML 1.2 `+.inf`, `-.inf`, `.nan`).
++pub(super) fn float32(
++    cfg: &Cfg,
++    value: &str,
++    tag: SfTag,
++    location: Location,
++) -> Result<f32, Error> {
++    validate_tag(cfg, tag, SfTag::Float, "floating point", location)?;
++    parse_yaml12_float(value, location, tag, cfg.angle_conversions)
++}
++
++/// Parse a 64-bit float (supports YAML 1.2 `+.inf`, `-.inf`, `.nan`).
++pub(super) fn float64(
++    cfg: &Cfg,
++    value: &str,
++    tag: SfTag,
++    location: Location,
++) -> Result<f64, Error> {
++    validate_tag(cfg, tag, SfTag::Float, "floating point", location)?;
++    parse_yaml12_float(value, location, tag, cfg.angle_conversions)
++}
++
++/// Whether a scalar is read as text: it is not plain, or its tag is one that reads as text.
++fn reads_as_text(tag: SfTag, style: ScalarStyle) -> bool {
++    !matches!(style, ScalarStyle::Plain)
++        || !tag.can_parse_into_string()
++        || tag == SfTag::Binary
++        || tag.forces_string()
++}
++
++/// Why a scalar is refused as text before its tag is looked at.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(super) enum TextRefusal {
++    /// The scalar is null: tagged `!!null`, or plain and null-like, and its tag is not a string
++    /// tag.
++    Null,
++    /// `no_schema` is set and the scalar is plain text that reads as a number, a boolean or a
++    /// null, and its tag is not a string tag.
++    QuotingRequired,
++}
++
++/// The refusals that come before the tag check when a scalar is read as text, in the order they
++/// apply: null first, then `no_schema` quoting.
++///
++/// `interpolated` is true when a `${...}` substitution produced `value`, which then is not null
++/// even when it is empty.
++pub(super) fn text_refusal(
++    cfg: &Cfg,
++    tag: SfTag,
++    value: &str,
++    style: ScalarStyle,
++    interpolated: bool,
++) -> Option<TextRefusal> {
++    if tag.forces_string() {
++        return None;
++    }
++    if tag == SfTag::Null || (!interpolated && scalar_is_nullish(value, &style)) {
++        Some(TextRefusal::Null)
++    } else if cfg.no_schema && maybe_not_string(value, &style, cfg.strict_booleans) {
++        Some(TextRefusal::QuotingRequired)
++    } else {
++        None
++    }
++}
++
++/// Check that the tag allows the scalar to be read as text.
++pub(super) fn check_text_tag(cfg: &Cfg, tag: SfTag, location: Location) -> Result<(), Error> {
++    if tag == SfTag::Binary && !cfg.ignore_binary_tag_for_string {
++        return Ok(());
++    }
++    if !(tag.can_parse_into_string() || cfg.ignore_binary_tag_for_string && tag == SfTag::Binary) {
++        return Err(Error::TaggedScalarCannotDeserializeIntoString { location });
++    }
++    Ok(())
++}
++
++/// Read a scalar as text, decoding `!!binary` into UTF-8 text unless the tag is ignored.
++///
++/// Errors if the tag is incompatible with strings or if the binary payload is not valid UTF-8.
++pub(super) fn string<'a>(
++    cfg: &Cfg,
++    value: Cow<'a, str>,
++    tag: SfTag,
++    location: Location,
++) -> Result<Cow<'a, str>, Error> {
++    check_text_tag(cfg, tag, location)?;
++    if tag == SfTag::Binary && !cfg.ignore_binary_tag_for_string {
++        let data = decode_base64_yaml(&value).map_err(|err| err.with_location(location))?;
++        let text = String::from_utf8(data).map_err(|_| Error::BinaryNotUtf8 { location })?;
++        return Ok(Cow::Owned(text));
++    }
++    Ok(value)
++}
++
++/// What a caller must do with a scalar once [`precheck`] has looked at it.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(super) enum Plan {
++    /// The scalar is an implicit null and nothing more is read from it.
++    Null,
++    /// Read the scalar and call [`infer`].
++    Read,
++}
++
++/// The part of [`infer`] that decides, from the scalar as first seen, whether it is read at all:
++/// whether an explicit type or text tag is compatible, and whether an untagged scalar is null.
++///
++/// The deserializer calls this before it consumes the scalar, so a scalar that is not read is
++/// not interpolated a second time.
++pub(super) fn precheck(
++    cfg: &Cfg,
++    value: &str,
++    tag: SfTag,
++    style: ScalarStyle,
++    location: Location,
++) -> Result<Plan, Error> {
++    match tag {
++        SfTag::Null | SfTag::Bool | SfTag::Int => return Ok(Plan::Read),
++        SfTag::Float | SfTag::Time | SfTag::Degrees | SfTag::Radians => {
++            validate_tag(cfg, tag, SfTag::Float, "floating point", location)?;
++            return Ok(Plan::Read);
++        }
++        _ => {}
++    }
++    // String tags (!!str and !) preserve null-like text (null, ~, empty).
++    if scalar_is_null(&tag, value, &style) {
++        return Ok(Plan::Null);
++    }
++    if reads_as_text(tag, style) {
++        check_text_tag(cfg, tag, location)?;
++    }
++    Ok(Plan::Read)
++}
++
++/// Deliver a float to a typeless reader, applying the configured non-finite policy.
++fn typeless_float<'a>(
++    cfg: &Cfg,
++    value: f64,
++    raw: &str,
++    location: Location,
++) -> Result<Inferred<'a>, Error> {
++    if value.is_finite() {
++        return Ok(Inferred::Float(value));
++    }
++    match cfg.non_finite_float_policy {
++        NonFiniteFloatPolicy::PassThrough => Ok(Inferred::Float(value)),
++        // Cfg resolves the compatibility default; an unconfigured policy otherwise
++        // has the same behavior as Reject.
++        NonFiniteFloatPolicy::Default | NonFiniteFloatPolicy::Reject => {
++            Err(Error::NonFiniteFloat {
++                value: raw.to_owned(),
++                location,
++            })
++        }
++        NonFiniteFloatPolicy::AsString => {
++            let canonical = if value.is_nan() {
++                ".nan"
++            } else if value.is_sign_negative() {
++                "-.inf"
++            } else {
++                ".inf"
++            };
++            Ok(Inferred::String(Cow::Owned(canonical.to_owned())))
++        }
++    }
++}
++
++/// What `deserialize_any` visits for a scalar whose processed value is `value`.
++///
++/// `raw` is the text as written, which a non-finite float error reports when interpolation has
++/// changed `value`.
++///
++/// Explicit scalar types take precedence over implicit null and string inference, including for
++/// quoted and block scalars buffered by Serde's flatten support. Plain, untagged scalars are
++/// inferred (null-like, bool, int, float) before falling back to string. Quoted scalars without a
++/// core type tag remain strings.
++pub(super) fn infer<'a>(
++    cfg: &Cfg,
++    value: Cow<'a, str>,
++    raw: &str,
++    tag: SfTag,
++    style: ScalarStyle,
++    location: Location,
++) -> Result<Inferred<'a>, Error> {
++    if precheck(cfg, &value, tag, style, location)? == Plan::Null {
++        return Ok(Inferred::Null);
++    }
++    match tag {
++        SfTag::Null => return Ok(Inferred::Null),
++        SfTag::Bool => return boolean(cfg, &value, tag, location).map(Inferred::Bool),
++        SfTag::Int if yaml_trim(&value).starts_with('-') => {
++            return signed(cfg, &value, tag, "i64", location).map(Inferred::Signed);
++        }
++        SfTag::Int => return unsigned(cfg, &value, tag, "u64", location).map(Inferred::Unsigned),
++        SfTag::Float | SfTag::Time | SfTag::Degrees | SfTag::Radians => {
++            let parsed =
++                try_parse_float_incl_overflow(&value, location, tag, cfg.angle_conversions).ok_or(
++                    Error::InvalidScalar {
++                        ty: "floating point",
++                        location,
++                    },
++                )?;
++            return typeless_float(cfg, parsed, raw, location);
++        }
++        _ => {}
++    }
++    if reads_as_text(tag, style) {
++        return string(cfg, value, tag, location).map(Inferred::String);
++    }
++
++    // Try booleans.
++    if cfg.strict_booleans {
++        if let Some(b) = parse_yaml12_bool(&value) {
++            return Ok(Inferred::Bool(b));
++        }
++    } else if let Some(b) = parse_yaml11_bool(&value) {
++        return Ok(Inferred::Bool(b));
++    }
++
++    let t = yaml_trim(&value);
++    // Preserve selected spellings before either numeric parser can consume them. Explicit
++    // numeric tags have already dispatched above.
++    if (cfg.leading_zero_numbers_as_strings && leading_zero_decimal(t))
++        || (cfg.underscored_numbers_as_strings && t.contains('_'))
++    {
++        return Ok(Inferred::String(value));
++    }
++
++    // Try integers: signed if leading '-', else unsigned, using 64-bit values.
++    if t.starts_with('-') {
++        if (!leading_zero_decimal(t) || cfg.legacy_octal_numbers)
++            && let Ok(v) = parse_int_signed::<i64>(t, "i64", location, cfg.legacy_octal_numbers)
++        {
++            return Ok(Inferred::Signed(v));
++        }
++    } else if let Ok(v) = parse_int_unsigned::<u64>(t, "u64", location, cfg.legacy_octal_numbers) {
++        return Ok(Inferred::Unsigned(v));
++    }
++
++    // Try float per YAML 1.2 forms, treating an f64-overflowing literal (e.g. `1e999`) as
++    // non-finite too, so both shapes are handled consistently.
++    if let Some(v) = try_parse_float_incl_overflow(&value, location, tag, cfg.angle_conversions) {
++        return typeless_float(cfg, v, raw, location);
++    }
++
++    // Fallback: treat as string as-is, preserving zero-copy borrowing.
++    Ok(Inferred::String(value))
++}
+diff --git a/src/de/tags.rs b/src/de/tags.rs
+index 3c5a6f52cd612f63bb8065b110b6f01f3765d9b5..a8cdfaaed020df7bff52ae98f2ee00e780adb21d 100644
+--- a/src/de/tags.rs
++++ b/src/de/tags.rs
+@@ -216,6 +216,19 @@ impl SfTag {
+         }
+     }
+ 
++    /// The tag whose resolved spelling is `spelling`: the text `Tag`'s `Display` gives, as
++    /// `Tagged` reports it. A resolved tag is the same whichever way it splits into handle and
++    /// suffix.
++    pub(crate) fn from_spelling(spelling: Option<&str>) -> SfTag {
++        let tag = spelling.map(|spelling| {
++            Cow::Owned(match spelling.strip_prefix('!') {
++                Some(suffix) => Tag::new("!", suffix),
++                None => Tag::new(spelling, ""),
++            })
++        });
++        Self::from_optional_cow(&tag)
++    }
++
+     /// Tags that preserve scalar text instead of allowing implicit type resolution.
+     pub(crate) fn forces_string(&self) -> bool {
+         matches!(self, SfTag::String | SfTag::NonSpecific)
+diff --git a/src/lib.rs b/src/lib.rs
+index 52f8ec77991daddfd49c527fae84a026f5d38669..fc7e4a9ab93a66da480520718fc5bd996112ab7a 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -64,6 +64,8 @@ pub use de::robotics;
+ #[cfg(all(feature = "deserialize", feature = "include_fs"))]
+ pub use de::safe_resolver::{SafeFileReadMode, SafeFileResolver, SymlinkPolicy};
+ #[cfg(feature = "deserialize")]
++pub use de::scalars;
++#[cfg(feature = "deserialize")]
+ pub use granit_parser;
+ pub use location::{Location, Locations};
+ pub use long_strings::{FoldStr, FoldString, LitStr, LitString};
+diff --git a/tests/fixtures/public_scalars.json b/tests/fixtures/public_scalars.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..2946a95c480d3a74c42033ae9e99d5a24b44c1ea
+--- /dev/null
++++ b/tests/fixtures/public_scalars.json
+@@ -0,0 +1,282 @@
++[
++  {"text":"1.10","options":"default","reads":{"typeless":{"ok":"Number(1.1)"},"string":{"ok":"\"1.10\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"1.1"}}},
++  {"text":"010","options":"default","reads":{"typeless":{"ok":"Number(10.0)"},"string":{"ok":"\"010\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"10.0"}}},
++  {"text":"0x10","options":"default","reads":{"typeless":{"ok":"Number(16)"},"string":{"ok":"\"0x10\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"16"},"u64":{"ok":"16"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"0o17","options":"default","reads":{"typeless":{"ok":"Number(15)"},"string":{"ok":"\"0o17\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"15"},"u64":{"ok":"15"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"0b101","options":"default","reads":{"typeless":{"ok":"Number(5)"},"string":{"ok":"\"0b101\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"5"},"u64":{"ok":"5"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"1e3","options":"default","reads":{"typeless":{"ok":"Number(1000.0)"},"string":{"ok":"\"1e3\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"1000.0"}}},
++  {"text":"+1","options":"default","reads":{"typeless":{"ok":"Number(1)"},"string":{"ok":"\"+1\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"1"},"u64":{"ok":"1"},"f64":{"ok":"1.0"}}},
++  {"text":"1_000","options":"default","reads":{"typeless":{"ok":"Number(1000)"},"string":{"ok":"\"1_000\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"1000"},"u64":{"ok":"1000"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":".inf","options":"default","reads":{"typeless":{"error":"non-finite float `.inf` rejected by the configured policy at line 1, column 1"},"string":{"ok":"\".inf\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"inf"}}},
++  {"text":".nan","options":"default","reads":{"typeless":{"error":"non-finite float `.nan` rejected by the configured policy at line 1, column 1"},"string":{"ok":"\".nan\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"NaN"}}},
++  {"text":"inf","options":"default","reads":{"typeless":{"ok":"String(\"inf\")"},"string":{"ok":"\"inf\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"True","options":"default","reads":{"typeless":{"ok":"Bool(true)"},"string":{"ok":"\"True\""},"bool":{"ok":"true"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"no","options":"default","reads":{"typeless":{"ok":"Bool(false)"},"string":{"ok":"\"no\""},"bool":{"ok":"false"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"~","options":"default","reads":{"typeless":{"ok":"Null"},"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 1"},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"null","options":"default","reads":{"typeless":{"ok":"Null"},"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 1"},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"","options":"default","reads":{"typeless":{"ok":"Null"},"string":{"error":"unexpected end of input at line 1, column 1"},"bool":{"error":"unexpected end of input at line 1, column 1"},"i64":{"error":"unexpected end of input at line 1, column 1"},"u64":{"error":"unexpected end of input at line 1, column 1"},"f64":{"error":"unexpected end of input at line 1, column 1"}},"rules":{"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 1"},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"'null'","options":"default","reads":{"typeless":{"ok":"String(\"null\")"},"string":{"ok":"\"null\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"\"8\"","options":"default","reads":{"typeless":{"ok":"String(\"8\")"},"string":{"ok":"\"8\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"8"},"u64":{"ok":"8"},"f64":{"ok":"8.0"}}},
++  {"text":"!!str 1","options":"default","reads":{"typeless":{"ok":"String(\"1\")"},"string":{"ok":"\"1\""},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"error":"invalid i64 at line 1, column 7"},"u64":{"error":"invalid u64 at line 1, column 7"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"!!int \"5\"","options":"default","reads":{"typeless":{"ok":"Number(5)"},"string":{"error":"cannot deserialize tagged scalar into string at line 1, column 7"},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"ok":"5"},"u64":{"ok":"5"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"!override 0","options":"default","reads":{"typeless":{"ok":"Number(0)"},"string":{"ok":"\"0\""},"bool":{"error":"invalid boolean at line 1, column 11"},"i64":{"ok":"0"},"u64":{"ok":"0"},"f64":{"ok":"0.0"}}},
++  {"text":"-7","options":"default","reads":{"typeless":{"ok":"Number(-7)"},"string":{"ok":"\"-7\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"-7"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"-7.0"}}},
++  {"text":"-0x10","options":"default","reads":{"typeless":{"ok":"Number(-16)"},"string":{"ok":"\"-0x10\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"-16"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"1e999","options":"default","reads":{"typeless":{"error":"non-finite float `1e999` rejected by the configured policy at line 1, column 1"},"string":{"ok":"\"1e999\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"-.inf","options":"default","reads":{"typeless":{"error":"non-finite float `-.inf` rejected by the configured policy at line 1, column 1"},"string":{"ok":"\"-.inf\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"-inf"}}},
++  {"text":"!!binary aGVsbG8=","options":"default","reads":{"typeless":{"ok":"String(\"hello\")"},"string":{"ok":"\"hello\""},"bool":{"error":"invalid boolean at line 1, column 10"},"i64":{"error":"invalid i64 at line 1, column 10"},"u64":{"error":"invalid u64 at line 1, column 10"},"f64":{"error":"invalid floating point at line 1, column 10"}}},
++  {"text":"!!float 1","options":"default","reads":{"typeless":{"ok":"Number(1.0)"},"string":{"error":"cannot deserialize tagged scalar into string at line 1, column 9"},"bool":{"error":"invalid boolean at line 1, column 9"},"i64":{"error":"invalid i64 at line 1, column 9"},"u64":{"error":"invalid u64 at line 1, column 9"},"f64":{"ok":"1.0"}}},
++  {"text":"!!bool yes","options":"default","reads":{"typeless":{"ok":"Bool(true)"},"string":{"error":"cannot deserialize tagged scalar into string at line 1, column 8"},"bool":{"ok":"true"},"i64":{"error":"invalid i64 at line 1, column 8"},"u64":{"error":"invalid u64 at line 1, column 8"},"f64":{"error":"invalid floating point at line 1, column 8"}}},
++  {"text":"!!null x","options":"default","reads":{"typeless":{"ok":"Null"},"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 8"},"bool":{"error":"invalid boolean at line 1, column 8"},"i64":{"error":"invalid i64 at line 1, column 8"},"u64":{"error":"invalid u64 at line 1, column 8"},"f64":{"error":"invalid floating point at line 1, column 8"}}},
++  {"text":"!!int 8080","options":"default","reads":{"typeless":{"ok":"Number(8080)"},"string":{"error":"cannot deserialize tagged scalar into string at line 1, column 7"},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"ok":"8080"},"u64":{"ok":"8080"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"!!int ~","options":"default","reads":{"typeless":{"error":"invalid u64 at line 1, column 7"},"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 7"},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"error":"invalid i64 at line 1, column 7"},"u64":{"error":"invalid u64 at line 1, column 7"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"!!binary aGk=","options":"default","reads":{"typeless":{"ok":"String(\"hi\")"},"string":{"ok":"\"hi\""},"bool":{"error":"invalid boolean at line 1, column 10"},"i64":{"error":"invalid i64 at line 1, column 10"},"u64":{"error":"invalid u64 at line 1, column 10"},"f64":{"error":"invalid floating point at line 1, column 10"}}},
++  {"text":"!!binary \"!!!\"","options":"default","reads":{"typeless":{"error":"invalid !!binary base64 at line 1, column 10"},"string":{"error":"invalid !!binary base64 at line 1, column 10"},"bool":{"error":"invalid boolean at line 1, column 10"},"i64":{"error":"invalid i64 at line 1, column 10"},"u64":{"error":"invalid u64 at line 1, column 10"},"f64":{"error":"invalid floating point at line 1, column 10"}}},
++  {"text":"!!str ~","options":"default","reads":{"typeless":{"ok":"String(\"~\")"},"string":{"ok":"\"~\""},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"error":"invalid i64 at line 1, column 7"},"u64":{"error":"invalid u64 at line 1, column 7"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"'~'","options":"default","reads":{"typeless":{"ok":"String(\"~\")"},"string":{"ok":"\"~\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"1.10","options":"strict_booleans","reads":{"typeless":{"ok":"Number(1.1)"},"string":{"ok":"\"1.10\""},"bool":{"error":"invalid boolean (strict mode expects true/false) at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"1.1"}}},
++  {"text":"010","options":"strict_booleans","reads":{"typeless":{"ok":"Number(10.0)"},"string":{"ok":"\"010\""},"bool":{"error":"invalid boolean (strict mode expects true/false) at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"10.0"}}},
++  {"text":"0x10","options":"strict_booleans","reads":{"typeless":{"ok":"Number(16)"},"string":{"ok":"\"0x10\""},"bool":{"error":"invalid boolean (strict mode expects true/false) at line 1, column 1"},"i64":{"ok":"16"},"u64":{"ok":"16"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"0o17","options":"strict_booleans","reads":{"typeless":{"ok":"Number(15)"},"string":{"ok":"\"0o17\""},"bool":{"error":"invalid boolean (strict mode expects true/false) at line 1, column 1"},"i64":{"ok":"15"},"u64":{"ok":"15"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"0b101","options":"strict_booleans","reads":{"typeless":{"ok":"Number(5)"},"string":{"ok":"\"0b101\""},"bool":{"error":"invalid boolean (strict mode expects true/false) at line 1, column 1"},"i64":{"ok":"5"},"u64":{"ok":"5"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"1e3","options":"strict_booleans","reads":{"typeless":{"ok":"Number(1000.0)"},"string":{"ok":"\"1e3\""},"bool":{"error":"invalid boolean (strict mode expects true/false) at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"1000.0"}}},
++  {"text":"+1","options":"strict_booleans","reads":{"typeless":{"ok":"Number(1)"},"string":{"ok":"\"+1\""},"bool":{"error":"invalid boolean (strict mode expects true/false) at line 1, column 1"},"i64":{"ok":"1"},"u64":{"ok":"1"},"f64":{"ok":"1.0"}}},
++  {"text":"1_000","options":"strict_booleans","reads":{"typeless":{"ok":"Number(1000)"},"string":{"ok":"\"1_000\""},"bool":{"error":"invalid boolean (strict mode expects true/false) at line 1, column 1"},"i64":{"ok":"1000"},"u64":{"ok":"1000"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":".inf","options":"strict_booleans","reads":{"typeless":{"error":"non-finite float `.inf` rejected by the configured policy at line 1, column 1"},"string":{"ok":"\".inf\""},"bool":{"error":"invalid boolean (strict mode expects true/false) at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"inf"}}},
++  {"text":".nan","options":"strict_booleans","reads":{"typeless":{"error":"non-finite float `.nan` rejected by the configured policy at line 1, column 1"},"string":{"ok":"\".nan\""},"bool":{"error":"invalid boolean (strict mode expects true/false) at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"NaN"}}},
++  {"text":"inf","options":"strict_booleans","reads":{"typeless":{"ok":"String(\"inf\")"},"string":{"ok":"\"inf\""},"bool":{"error":"invalid boolean (strict mode expects true/false) at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"True","options":"strict_booleans","reads":{"typeless":{"ok":"Bool(true)"},"string":{"ok":"\"True\""},"bool":{"ok":"true"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"no","options":"strict_booleans","reads":{"typeless":{"ok":"String(\"no\")"},"string":{"ok":"\"no\""},"bool":{"error":"invalid boolean (strict mode expects true/false) at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"~","options":"strict_booleans","reads":{"typeless":{"ok":"Null"},"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 1"},"bool":{"error":"invalid boolean (strict mode expects true/false) at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"null","options":"strict_booleans","reads":{"typeless":{"ok":"Null"},"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 1"},"bool":{"error":"invalid boolean (strict mode expects true/false) at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"","options":"strict_booleans","reads":{"typeless":{"ok":"Null"},"string":{"error":"unexpected end of input at line 1, column 1"},"bool":{"error":"unexpected end of input at line 1, column 1"},"i64":{"error":"unexpected end of input at line 1, column 1"},"u64":{"error":"unexpected end of input at line 1, column 1"},"f64":{"error":"unexpected end of input at line 1, column 1"}},"rules":{"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 1"},"bool":{"error":"invalid boolean (strict mode expects true/false) at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"'null'","options":"strict_booleans","reads":{"typeless":{"ok":"String(\"null\")"},"string":{"ok":"\"null\""},"bool":{"error":"invalid boolean (strict mode expects true/false) at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"\"8\"","options":"strict_booleans","reads":{"typeless":{"ok":"String(\"8\")"},"string":{"ok":"\"8\""},"bool":{"error":"invalid boolean (strict mode expects true/false) at line 1, column 1"},"i64":{"ok":"8"},"u64":{"ok":"8"},"f64":{"ok":"8.0"}}},
++  {"text":"!!str 1","options":"strict_booleans","reads":{"typeless":{"ok":"String(\"1\")"},"string":{"ok":"\"1\""},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"error":"invalid i64 at line 1, column 7"},"u64":{"error":"invalid u64 at line 1, column 7"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"!!int \"5\"","options":"strict_booleans","reads":{"typeless":{"ok":"Number(5)"},"string":{"error":"cannot deserialize tagged scalar into string at line 1, column 7"},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"ok":"5"},"u64":{"ok":"5"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"!override 0","options":"strict_booleans","reads":{"typeless":{"ok":"Number(0)"},"string":{"ok":"\"0\""},"bool":{"error":"invalid boolean (strict mode expects true/false) at line 1, column 11"},"i64":{"ok":"0"},"u64":{"ok":"0"},"f64":{"ok":"0.0"}}},
++  {"text":"-7","options":"strict_booleans","reads":{"typeless":{"ok":"Number(-7)"},"string":{"ok":"\"-7\""},"bool":{"error":"invalid boolean (strict mode expects true/false) at line 1, column 1"},"i64":{"ok":"-7"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"-7.0"}}},
++  {"text":"-0x10","options":"strict_booleans","reads":{"typeless":{"ok":"Number(-16)"},"string":{"ok":"\"-0x10\""},"bool":{"error":"invalid boolean (strict mode expects true/false) at line 1, column 1"},"i64":{"ok":"-16"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"1e999","options":"strict_booleans","reads":{"typeless":{"error":"non-finite float `1e999` rejected by the configured policy at line 1, column 1"},"string":{"ok":"\"1e999\""},"bool":{"error":"invalid boolean (strict mode expects true/false) at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"-.inf","options":"strict_booleans","reads":{"typeless":{"error":"non-finite float `-.inf` rejected by the configured policy at line 1, column 1"},"string":{"ok":"\"-.inf\""},"bool":{"error":"invalid boolean (strict mode expects true/false) at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"-inf"}}},
++  {"text":"!!binary aGVsbG8=","options":"strict_booleans","reads":{"typeless":{"ok":"String(\"hello\")"},"string":{"ok":"\"hello\""},"bool":{"error":"invalid boolean at line 1, column 10"},"i64":{"error":"invalid i64 at line 1, column 10"},"u64":{"error":"invalid u64 at line 1, column 10"},"f64":{"error":"invalid floating point at line 1, column 10"}}},
++  {"text":"!!float 1","options":"strict_booleans","reads":{"typeless":{"ok":"Number(1.0)"},"string":{"error":"cannot deserialize tagged scalar into string at line 1, column 9"},"bool":{"error":"invalid boolean at line 1, column 9"},"i64":{"error":"invalid i64 at line 1, column 9"},"u64":{"error":"invalid u64 at line 1, column 9"},"f64":{"ok":"1.0"}}},
++  {"text":"!!bool yes","options":"strict_booleans","reads":{"typeless":{"error":"invalid boolean (strict mode expects true/false) at line 1, column 8"},"string":{"error":"cannot deserialize tagged scalar into string at line 1, column 8"},"bool":{"error":"invalid boolean (strict mode expects true/false) at line 1, column 8"},"i64":{"error":"invalid i64 at line 1, column 8"},"u64":{"error":"invalid u64 at line 1, column 8"},"f64":{"error":"invalid floating point at line 1, column 8"}}},
++  {"text":"!!null x","options":"strict_booleans","reads":{"typeless":{"ok":"Null"},"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 8"},"bool":{"error":"invalid boolean at line 1, column 8"},"i64":{"error":"invalid i64 at line 1, column 8"},"u64":{"error":"invalid u64 at line 1, column 8"},"f64":{"error":"invalid floating point at line 1, column 8"}}},
++  {"text":"!!int 8080","options":"strict_booleans","reads":{"typeless":{"ok":"Number(8080)"},"string":{"error":"cannot deserialize tagged scalar into string at line 1, column 7"},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"ok":"8080"},"u64":{"ok":"8080"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"!!int ~","options":"strict_booleans","reads":{"typeless":{"error":"invalid u64 at line 1, column 7"},"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 7"},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"error":"invalid i64 at line 1, column 7"},"u64":{"error":"invalid u64 at line 1, column 7"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"!!binary aGk=","options":"strict_booleans","reads":{"typeless":{"ok":"String(\"hi\")"},"string":{"ok":"\"hi\""},"bool":{"error":"invalid boolean at line 1, column 10"},"i64":{"error":"invalid i64 at line 1, column 10"},"u64":{"error":"invalid u64 at line 1, column 10"},"f64":{"error":"invalid floating point at line 1, column 10"}}},
++  {"text":"!!binary \"!!!\"","options":"strict_booleans","reads":{"typeless":{"error":"invalid !!binary base64 at line 1, column 10"},"string":{"error":"invalid !!binary base64 at line 1, column 10"},"bool":{"error":"invalid boolean at line 1, column 10"},"i64":{"error":"invalid i64 at line 1, column 10"},"u64":{"error":"invalid u64 at line 1, column 10"},"f64":{"error":"invalid floating point at line 1, column 10"}}},
++  {"text":"!!str ~","options":"strict_booleans","reads":{"typeless":{"ok":"String(\"~\")"},"string":{"ok":"\"~\""},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"error":"invalid i64 at line 1, column 7"},"u64":{"error":"invalid u64 at line 1, column 7"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"'~'","options":"strict_booleans","reads":{"typeless":{"ok":"String(\"~\")"},"string":{"ok":"\"~\""},"bool":{"error":"invalid boolean (strict mode expects true/false) at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"1.10","options":"legacy_octal_numbers","reads":{"typeless":{"ok":"Number(1.1)"},"string":{"ok":"\"1.10\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"1.1"}}},
++  {"text":"010","options":"legacy_octal_numbers","reads":{"typeless":{"ok":"Number(8)"},"string":{"ok":"\"010\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"8"},"u64":{"ok":"8"},"f64":{"ok":"10.0"}}},
++  {"text":"0x10","options":"legacy_octal_numbers","reads":{"typeless":{"ok":"Number(16)"},"string":{"ok":"\"0x10\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"16"},"u64":{"ok":"16"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"0o17","options":"legacy_octal_numbers","reads":{"typeless":{"ok":"Number(15)"},"string":{"ok":"\"0o17\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"15"},"u64":{"ok":"15"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"0b101","options":"legacy_octal_numbers","reads":{"typeless":{"ok":"Number(5)"},"string":{"ok":"\"0b101\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"5"},"u64":{"ok":"5"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"1e3","options":"legacy_octal_numbers","reads":{"typeless":{"ok":"Number(1000.0)"},"string":{"ok":"\"1e3\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"1000.0"}}},
++  {"text":"+1","options":"legacy_octal_numbers","reads":{"typeless":{"ok":"Number(1)"},"string":{"ok":"\"+1\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"1"},"u64":{"ok":"1"},"f64":{"ok":"1.0"}}},
++  {"text":"1_000","options":"legacy_octal_numbers","reads":{"typeless":{"ok":"Number(1000)"},"string":{"ok":"\"1_000\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"1000"},"u64":{"ok":"1000"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":".inf","options":"legacy_octal_numbers","reads":{"typeless":{"error":"non-finite float `.inf` rejected by the configured policy at line 1, column 1"},"string":{"ok":"\".inf\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"inf"}}},
++  {"text":".nan","options":"legacy_octal_numbers","reads":{"typeless":{"error":"non-finite float `.nan` rejected by the configured policy at line 1, column 1"},"string":{"ok":"\".nan\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"NaN"}}},
++  {"text":"inf","options":"legacy_octal_numbers","reads":{"typeless":{"ok":"String(\"inf\")"},"string":{"ok":"\"inf\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"True","options":"legacy_octal_numbers","reads":{"typeless":{"ok":"Bool(true)"},"string":{"ok":"\"True\""},"bool":{"ok":"true"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"no","options":"legacy_octal_numbers","reads":{"typeless":{"ok":"Bool(false)"},"string":{"ok":"\"no\""},"bool":{"ok":"false"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"~","options":"legacy_octal_numbers","reads":{"typeless":{"ok":"Null"},"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 1"},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"null","options":"legacy_octal_numbers","reads":{"typeless":{"ok":"Null"},"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 1"},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"","options":"legacy_octal_numbers","reads":{"typeless":{"ok":"Null"},"string":{"error":"unexpected end of input at line 1, column 1"},"bool":{"error":"unexpected end of input at line 1, column 1"},"i64":{"error":"unexpected end of input at line 1, column 1"},"u64":{"error":"unexpected end of input at line 1, column 1"},"f64":{"error":"unexpected end of input at line 1, column 1"}},"rules":{"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 1"},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"'null'","options":"legacy_octal_numbers","reads":{"typeless":{"ok":"String(\"null\")"},"string":{"ok":"\"null\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"\"8\"","options":"legacy_octal_numbers","reads":{"typeless":{"ok":"String(\"8\")"},"string":{"ok":"\"8\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"8"},"u64":{"ok":"8"},"f64":{"ok":"8.0"}}},
++  {"text":"!!str 1","options":"legacy_octal_numbers","reads":{"typeless":{"ok":"String(\"1\")"},"string":{"ok":"\"1\""},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"error":"invalid i64 at line 1, column 7"},"u64":{"error":"invalid u64 at line 1, column 7"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"!!int \"5\"","options":"legacy_octal_numbers","reads":{"typeless":{"ok":"Number(5)"},"string":{"error":"cannot deserialize tagged scalar into string at line 1, column 7"},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"ok":"5"},"u64":{"ok":"5"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"!override 0","options":"legacy_octal_numbers","reads":{"typeless":{"ok":"Number(0)"},"string":{"ok":"\"0\""},"bool":{"error":"invalid boolean at line 1, column 11"},"i64":{"ok":"0"},"u64":{"ok":"0"},"f64":{"ok":"0.0"}}},
++  {"text":"-7","options":"legacy_octal_numbers","reads":{"typeless":{"ok":"Number(-7)"},"string":{"ok":"\"-7\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"-7"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"-7.0"}}},
++  {"text":"-0x10","options":"legacy_octal_numbers","reads":{"typeless":{"ok":"Number(-16)"},"string":{"ok":"\"-0x10\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"-16"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"1e999","options":"legacy_octal_numbers","reads":{"typeless":{"error":"non-finite float `1e999` rejected by the configured policy at line 1, column 1"},"string":{"ok":"\"1e999\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"-.inf","options":"legacy_octal_numbers","reads":{"typeless":{"error":"non-finite float `-.inf` rejected by the configured policy at line 1, column 1"},"string":{"ok":"\"-.inf\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"-inf"}}},
++  {"text":"!!binary aGVsbG8=","options":"legacy_octal_numbers","reads":{"typeless":{"ok":"String(\"hello\")"},"string":{"ok":"\"hello\""},"bool":{"error":"invalid boolean at line 1, column 10"},"i64":{"error":"invalid i64 at line 1, column 10"},"u64":{"error":"invalid u64 at line 1, column 10"},"f64":{"error":"invalid floating point at line 1, column 10"}}},
++  {"text":"!!float 1","options":"legacy_octal_numbers","reads":{"typeless":{"ok":"Number(1.0)"},"string":{"error":"cannot deserialize tagged scalar into string at line 1, column 9"},"bool":{"error":"invalid boolean at line 1, column 9"},"i64":{"error":"invalid i64 at line 1, column 9"},"u64":{"error":"invalid u64 at line 1, column 9"},"f64":{"ok":"1.0"}}},
++  {"text":"!!bool yes","options":"legacy_octal_numbers","reads":{"typeless":{"ok":"Bool(true)"},"string":{"error":"cannot deserialize tagged scalar into string at line 1, column 8"},"bool":{"ok":"true"},"i64":{"error":"invalid i64 at line 1, column 8"},"u64":{"error":"invalid u64 at line 1, column 8"},"f64":{"error":"invalid floating point at line 1, column 8"}}},
++  {"text":"!!null x","options":"legacy_octal_numbers","reads":{"typeless":{"ok":"Null"},"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 8"},"bool":{"error":"invalid boolean at line 1, column 8"},"i64":{"error":"invalid i64 at line 1, column 8"},"u64":{"error":"invalid u64 at line 1, column 8"},"f64":{"error":"invalid floating point at line 1, column 8"}}},
++  {"text":"!!int 8080","options":"legacy_octal_numbers","reads":{"typeless":{"ok":"Number(8080)"},"string":{"error":"cannot deserialize tagged scalar into string at line 1, column 7"},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"ok":"8080"},"u64":{"ok":"8080"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"!!int ~","options":"legacy_octal_numbers","reads":{"typeless":{"error":"invalid u64 at line 1, column 7"},"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 7"},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"error":"invalid i64 at line 1, column 7"},"u64":{"error":"invalid u64 at line 1, column 7"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"!!binary aGk=","options":"legacy_octal_numbers","reads":{"typeless":{"ok":"String(\"hi\")"},"string":{"ok":"\"hi\""},"bool":{"error":"invalid boolean at line 1, column 10"},"i64":{"error":"invalid i64 at line 1, column 10"},"u64":{"error":"invalid u64 at line 1, column 10"},"f64":{"error":"invalid floating point at line 1, column 10"}}},
++  {"text":"!!binary \"!!!\"","options":"legacy_octal_numbers","reads":{"typeless":{"error":"invalid !!binary base64 at line 1, column 10"},"string":{"error":"invalid !!binary base64 at line 1, column 10"},"bool":{"error":"invalid boolean at line 1, column 10"},"i64":{"error":"invalid i64 at line 1, column 10"},"u64":{"error":"invalid u64 at line 1, column 10"},"f64":{"error":"invalid floating point at line 1, column 10"}}},
++  {"text":"!!str ~","options":"legacy_octal_numbers","reads":{"typeless":{"ok":"String(\"~\")"},"string":{"ok":"\"~\""},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"error":"invalid i64 at line 1, column 7"},"u64":{"error":"invalid u64 at line 1, column 7"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"'~'","options":"legacy_octal_numbers","reads":{"typeless":{"ok":"String(\"~\")"},"string":{"ok":"\"~\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"1.10","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"ok":"Number(1.1)"},"string":{"ok":"\"1.10\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"1.1"}}},
++  {"text":"010","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"ok":"String(\"010\")"},"string":{"ok":"\"010\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"10.0"}}},
++  {"text":"0x10","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"ok":"Number(16)"},"string":{"ok":"\"0x10\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"16"},"u64":{"ok":"16"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"0o17","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"ok":"Number(15)"},"string":{"ok":"\"0o17\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"15"},"u64":{"ok":"15"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"0b101","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"ok":"Number(5)"},"string":{"ok":"\"0b101\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"5"},"u64":{"ok":"5"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"1e3","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"ok":"Number(1000.0)"},"string":{"ok":"\"1e3\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"1000.0"}}},
++  {"text":"+1","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"ok":"Number(1)"},"string":{"ok":"\"+1\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"1"},"u64":{"ok":"1"},"f64":{"ok":"1.0"}}},
++  {"text":"1_000","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"ok":"Number(1000)"},"string":{"ok":"\"1_000\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"1000"},"u64":{"ok":"1000"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":".inf","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"error":"non-finite float `.inf` rejected by the configured policy at line 1, column 1"},"string":{"ok":"\".inf\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"inf"}}},
++  {"text":".nan","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"error":"non-finite float `.nan` rejected by the configured policy at line 1, column 1"},"string":{"ok":"\".nan\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"NaN"}}},
++  {"text":"inf","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"ok":"String(\"inf\")"},"string":{"ok":"\"inf\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"True","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"ok":"Bool(true)"},"string":{"ok":"\"True\""},"bool":{"ok":"true"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"no","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"ok":"Bool(false)"},"string":{"ok":"\"no\""},"bool":{"ok":"false"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"~","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"ok":"Null"},"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 1"},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"null","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"ok":"Null"},"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 1"},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"ok":"Null"},"string":{"error":"unexpected end of input at line 1, column 1"},"bool":{"error":"unexpected end of input at line 1, column 1"},"i64":{"error":"unexpected end of input at line 1, column 1"},"u64":{"error":"unexpected end of input at line 1, column 1"},"f64":{"error":"unexpected end of input at line 1, column 1"}},"rules":{"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 1"},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"'null'","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"ok":"String(\"null\")"},"string":{"ok":"\"null\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"\"8\"","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"ok":"String(\"8\")"},"string":{"ok":"\"8\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"8"},"u64":{"ok":"8"},"f64":{"ok":"8.0"}}},
++  {"text":"!!str 1","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"ok":"String(\"1\")"},"string":{"ok":"\"1\""},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"error":"invalid i64 at line 1, column 7"},"u64":{"error":"invalid u64 at line 1, column 7"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"!!int \"5\"","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"ok":"Number(5)"},"string":{"error":"cannot deserialize tagged scalar into string at line 1, column 7"},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"ok":"5"},"u64":{"ok":"5"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"!override 0","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"ok":"Number(0)"},"string":{"ok":"\"0\""},"bool":{"error":"invalid boolean at line 1, column 11"},"i64":{"ok":"0"},"u64":{"ok":"0"},"f64":{"ok":"0.0"}}},
++  {"text":"-7","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"ok":"Number(-7)"},"string":{"ok":"\"-7\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"-7"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"-7.0"}}},
++  {"text":"-0x10","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"ok":"Number(-16)"},"string":{"ok":"\"-0x10\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"-16"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"1e999","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"error":"non-finite float `1e999` rejected by the configured policy at line 1, column 1"},"string":{"ok":"\"1e999\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"-.inf","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"error":"non-finite float `-.inf` rejected by the configured policy at line 1, column 1"},"string":{"ok":"\"-.inf\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"-inf"}}},
++  {"text":"!!binary aGVsbG8=","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"ok":"String(\"hello\")"},"string":{"ok":"\"hello\""},"bool":{"error":"invalid boolean at line 1, column 10"},"i64":{"error":"invalid i64 at line 1, column 10"},"u64":{"error":"invalid u64 at line 1, column 10"},"f64":{"error":"invalid floating point at line 1, column 10"}}},
++  {"text":"!!float 1","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"ok":"Number(1.0)"},"string":{"error":"cannot deserialize tagged scalar into string at line 1, column 9"},"bool":{"error":"invalid boolean at line 1, column 9"},"i64":{"error":"invalid i64 at line 1, column 9"},"u64":{"error":"invalid u64 at line 1, column 9"},"f64":{"ok":"1.0"}}},
++  {"text":"!!bool yes","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"ok":"Bool(true)"},"string":{"error":"cannot deserialize tagged scalar into string at line 1, column 8"},"bool":{"ok":"true"},"i64":{"error":"invalid i64 at line 1, column 8"},"u64":{"error":"invalid u64 at line 1, column 8"},"f64":{"error":"invalid floating point at line 1, column 8"}}},
++  {"text":"!!null x","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"ok":"Null"},"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 8"},"bool":{"error":"invalid boolean at line 1, column 8"},"i64":{"error":"invalid i64 at line 1, column 8"},"u64":{"error":"invalid u64 at line 1, column 8"},"f64":{"error":"invalid floating point at line 1, column 8"}}},
++  {"text":"!!int 8080","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"ok":"Number(8080)"},"string":{"error":"cannot deserialize tagged scalar into string at line 1, column 7"},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"ok":"8080"},"u64":{"ok":"8080"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"!!int ~","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"error":"invalid u64 at line 1, column 7"},"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 7"},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"error":"invalid i64 at line 1, column 7"},"u64":{"error":"invalid u64 at line 1, column 7"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"!!binary aGk=","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"ok":"String(\"hi\")"},"string":{"ok":"\"hi\""},"bool":{"error":"invalid boolean at line 1, column 10"},"i64":{"error":"invalid i64 at line 1, column 10"},"u64":{"error":"invalid u64 at line 1, column 10"},"f64":{"error":"invalid floating point at line 1, column 10"}}},
++  {"text":"!!binary \"!!!\"","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"error":"invalid !!binary base64 at line 1, column 10"},"string":{"error":"invalid !!binary base64 at line 1, column 10"},"bool":{"error":"invalid boolean at line 1, column 10"},"i64":{"error":"invalid i64 at line 1, column 10"},"u64":{"error":"invalid u64 at line 1, column 10"},"f64":{"error":"invalid floating point at line 1, column 10"}}},
++  {"text":"!!str ~","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"ok":"String(\"~\")"},"string":{"ok":"\"~\""},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"error":"invalid i64 at line 1, column 7"},"u64":{"error":"invalid u64 at line 1, column 7"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"'~'","options":"leading_zero_numbers_as_strings","reads":{"typeless":{"ok":"String(\"~\")"},"string":{"ok":"\"~\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"1.10","options":"underscored_numbers_as_strings","reads":{"typeless":{"ok":"Number(1.1)"},"string":{"ok":"\"1.10\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"1.1"}}},
++  {"text":"010","options":"underscored_numbers_as_strings","reads":{"typeless":{"ok":"Number(10.0)"},"string":{"ok":"\"010\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"10.0"}}},
++  {"text":"0x10","options":"underscored_numbers_as_strings","reads":{"typeless":{"ok":"Number(16)"},"string":{"ok":"\"0x10\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"16"},"u64":{"ok":"16"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"0o17","options":"underscored_numbers_as_strings","reads":{"typeless":{"ok":"Number(15)"},"string":{"ok":"\"0o17\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"15"},"u64":{"ok":"15"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"0b101","options":"underscored_numbers_as_strings","reads":{"typeless":{"ok":"Number(5)"},"string":{"ok":"\"0b101\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"5"},"u64":{"ok":"5"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"1e3","options":"underscored_numbers_as_strings","reads":{"typeless":{"ok":"Number(1000.0)"},"string":{"ok":"\"1e3\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"1000.0"}}},
++  {"text":"+1","options":"underscored_numbers_as_strings","reads":{"typeless":{"ok":"Number(1)"},"string":{"ok":"\"+1\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"1"},"u64":{"ok":"1"},"f64":{"ok":"1.0"}}},
++  {"text":"1_000","options":"underscored_numbers_as_strings","reads":{"typeless":{"ok":"String(\"1_000\")"},"string":{"ok":"\"1_000\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"1000"},"u64":{"ok":"1000"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":".inf","options":"underscored_numbers_as_strings","reads":{"typeless":{"error":"non-finite float `.inf` rejected by the configured policy at line 1, column 1"},"string":{"ok":"\".inf\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"inf"}}},
++  {"text":".nan","options":"underscored_numbers_as_strings","reads":{"typeless":{"error":"non-finite float `.nan` rejected by the configured policy at line 1, column 1"},"string":{"ok":"\".nan\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"NaN"}}},
++  {"text":"inf","options":"underscored_numbers_as_strings","reads":{"typeless":{"ok":"String(\"inf\")"},"string":{"ok":"\"inf\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"True","options":"underscored_numbers_as_strings","reads":{"typeless":{"ok":"Bool(true)"},"string":{"ok":"\"True\""},"bool":{"ok":"true"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"no","options":"underscored_numbers_as_strings","reads":{"typeless":{"ok":"Bool(false)"},"string":{"ok":"\"no\""},"bool":{"ok":"false"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"~","options":"underscored_numbers_as_strings","reads":{"typeless":{"ok":"Null"},"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 1"},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"null","options":"underscored_numbers_as_strings","reads":{"typeless":{"ok":"Null"},"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 1"},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"","options":"underscored_numbers_as_strings","reads":{"typeless":{"ok":"Null"},"string":{"error":"unexpected end of input at line 1, column 1"},"bool":{"error":"unexpected end of input at line 1, column 1"},"i64":{"error":"unexpected end of input at line 1, column 1"},"u64":{"error":"unexpected end of input at line 1, column 1"},"f64":{"error":"unexpected end of input at line 1, column 1"}},"rules":{"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 1"},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"'null'","options":"underscored_numbers_as_strings","reads":{"typeless":{"ok":"String(\"null\")"},"string":{"ok":"\"null\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"\"8\"","options":"underscored_numbers_as_strings","reads":{"typeless":{"ok":"String(\"8\")"},"string":{"ok":"\"8\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"8"},"u64":{"ok":"8"},"f64":{"ok":"8.0"}}},
++  {"text":"!!str 1","options":"underscored_numbers_as_strings","reads":{"typeless":{"ok":"String(\"1\")"},"string":{"ok":"\"1\""},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"error":"invalid i64 at line 1, column 7"},"u64":{"error":"invalid u64 at line 1, column 7"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"!!int \"5\"","options":"underscored_numbers_as_strings","reads":{"typeless":{"ok":"Number(5)"},"string":{"error":"cannot deserialize tagged scalar into string at line 1, column 7"},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"ok":"5"},"u64":{"ok":"5"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"!override 0","options":"underscored_numbers_as_strings","reads":{"typeless":{"ok":"Number(0)"},"string":{"ok":"\"0\""},"bool":{"error":"invalid boolean at line 1, column 11"},"i64":{"ok":"0"},"u64":{"ok":"0"},"f64":{"ok":"0.0"}}},
++  {"text":"-7","options":"underscored_numbers_as_strings","reads":{"typeless":{"ok":"Number(-7)"},"string":{"ok":"\"-7\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"-7"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"-7.0"}}},
++  {"text":"-0x10","options":"underscored_numbers_as_strings","reads":{"typeless":{"ok":"Number(-16)"},"string":{"ok":"\"-0x10\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"-16"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"1e999","options":"underscored_numbers_as_strings","reads":{"typeless":{"error":"non-finite float `1e999` rejected by the configured policy at line 1, column 1"},"string":{"ok":"\"1e999\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"-.inf","options":"underscored_numbers_as_strings","reads":{"typeless":{"error":"non-finite float `-.inf` rejected by the configured policy at line 1, column 1"},"string":{"ok":"\"-.inf\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"-inf"}}},
++  {"text":"!!binary aGVsbG8=","options":"underscored_numbers_as_strings","reads":{"typeless":{"ok":"String(\"hello\")"},"string":{"ok":"\"hello\""},"bool":{"error":"invalid boolean at line 1, column 10"},"i64":{"error":"invalid i64 at line 1, column 10"},"u64":{"error":"invalid u64 at line 1, column 10"},"f64":{"error":"invalid floating point at line 1, column 10"}}},
++  {"text":"!!float 1","options":"underscored_numbers_as_strings","reads":{"typeless":{"ok":"Number(1.0)"},"string":{"error":"cannot deserialize tagged scalar into string at line 1, column 9"},"bool":{"error":"invalid boolean at line 1, column 9"},"i64":{"error":"invalid i64 at line 1, column 9"},"u64":{"error":"invalid u64 at line 1, column 9"},"f64":{"ok":"1.0"}}},
++  {"text":"!!bool yes","options":"underscored_numbers_as_strings","reads":{"typeless":{"ok":"Bool(true)"},"string":{"error":"cannot deserialize tagged scalar into string at line 1, column 8"},"bool":{"ok":"true"},"i64":{"error":"invalid i64 at line 1, column 8"},"u64":{"error":"invalid u64 at line 1, column 8"},"f64":{"error":"invalid floating point at line 1, column 8"}}},
++  {"text":"!!null x","options":"underscored_numbers_as_strings","reads":{"typeless":{"ok":"Null"},"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 8"},"bool":{"error":"invalid boolean at line 1, column 8"},"i64":{"error":"invalid i64 at line 1, column 8"},"u64":{"error":"invalid u64 at line 1, column 8"},"f64":{"error":"invalid floating point at line 1, column 8"}}},
++  {"text":"!!int 8080","options":"underscored_numbers_as_strings","reads":{"typeless":{"ok":"Number(8080)"},"string":{"error":"cannot deserialize tagged scalar into string at line 1, column 7"},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"ok":"8080"},"u64":{"ok":"8080"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"!!int ~","options":"underscored_numbers_as_strings","reads":{"typeless":{"error":"invalid u64 at line 1, column 7"},"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 7"},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"error":"invalid i64 at line 1, column 7"},"u64":{"error":"invalid u64 at line 1, column 7"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"!!binary aGk=","options":"underscored_numbers_as_strings","reads":{"typeless":{"ok":"String(\"hi\")"},"string":{"ok":"\"hi\""},"bool":{"error":"invalid boolean at line 1, column 10"},"i64":{"error":"invalid i64 at line 1, column 10"},"u64":{"error":"invalid u64 at line 1, column 10"},"f64":{"error":"invalid floating point at line 1, column 10"}}},
++  {"text":"!!binary \"!!!\"","options":"underscored_numbers_as_strings","reads":{"typeless":{"error":"invalid !!binary base64 at line 1, column 10"},"string":{"error":"invalid !!binary base64 at line 1, column 10"},"bool":{"error":"invalid boolean at line 1, column 10"},"i64":{"error":"invalid i64 at line 1, column 10"},"u64":{"error":"invalid u64 at line 1, column 10"},"f64":{"error":"invalid floating point at line 1, column 10"}}},
++  {"text":"!!str ~","options":"underscored_numbers_as_strings","reads":{"typeless":{"ok":"String(\"~\")"},"string":{"ok":"\"~\""},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"error":"invalid i64 at line 1, column 7"},"u64":{"error":"invalid u64 at line 1, column 7"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"'~'","options":"underscored_numbers_as_strings","reads":{"typeless":{"ok":"String(\"~\")"},"string":{"ok":"\"~\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"1.10","options":"reject non-finite","reads":{"typeless":{"ok":"Number(1.1)"},"string":{"ok":"\"1.10\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"1.1"}}},
++  {"text":"010","options":"reject non-finite","reads":{"typeless":{"ok":"Number(10.0)"},"string":{"ok":"\"010\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"10.0"}}},
++  {"text":"0x10","options":"reject non-finite","reads":{"typeless":{"ok":"Number(16)"},"string":{"ok":"\"0x10\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"16"},"u64":{"ok":"16"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"0o17","options":"reject non-finite","reads":{"typeless":{"ok":"Number(15)"},"string":{"ok":"\"0o17\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"15"},"u64":{"ok":"15"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"0b101","options":"reject non-finite","reads":{"typeless":{"ok":"Number(5)"},"string":{"ok":"\"0b101\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"5"},"u64":{"ok":"5"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"1e3","options":"reject non-finite","reads":{"typeless":{"ok":"Number(1000.0)"},"string":{"ok":"\"1e3\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"1000.0"}}},
++  {"text":"+1","options":"reject non-finite","reads":{"typeless":{"ok":"Number(1)"},"string":{"ok":"\"+1\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"1"},"u64":{"ok":"1"},"f64":{"ok":"1.0"}}},
++  {"text":"1_000","options":"reject non-finite","reads":{"typeless":{"ok":"Number(1000)"},"string":{"ok":"\"1_000\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"1000"},"u64":{"ok":"1000"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":".inf","options":"reject non-finite","reads":{"typeless":{"error":"non-finite float `.inf` rejected by the configured policy at line 1, column 1"},"string":{"ok":"\".inf\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"inf"}}},
++  {"text":".nan","options":"reject non-finite","reads":{"typeless":{"error":"non-finite float `.nan` rejected by the configured policy at line 1, column 1"},"string":{"ok":"\".nan\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"NaN"}}},
++  {"text":"inf","options":"reject non-finite","reads":{"typeless":{"ok":"String(\"inf\")"},"string":{"ok":"\"inf\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"True","options":"reject non-finite","reads":{"typeless":{"ok":"Bool(true)"},"string":{"ok":"\"True\""},"bool":{"ok":"true"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"no","options":"reject non-finite","reads":{"typeless":{"ok":"Bool(false)"},"string":{"ok":"\"no\""},"bool":{"ok":"false"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"~","options":"reject non-finite","reads":{"typeless":{"ok":"Null"},"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 1"},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"null","options":"reject non-finite","reads":{"typeless":{"ok":"Null"},"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 1"},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"","options":"reject non-finite","reads":{"typeless":{"ok":"Null"},"string":{"error":"unexpected end of input at line 1, column 1"},"bool":{"error":"unexpected end of input at line 1, column 1"},"i64":{"error":"unexpected end of input at line 1, column 1"},"u64":{"error":"unexpected end of input at line 1, column 1"},"f64":{"error":"unexpected end of input at line 1, column 1"}},"rules":{"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 1"},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"'null'","options":"reject non-finite","reads":{"typeless":{"ok":"String(\"null\")"},"string":{"ok":"\"null\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"\"8\"","options":"reject non-finite","reads":{"typeless":{"ok":"String(\"8\")"},"string":{"ok":"\"8\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"8"},"u64":{"ok":"8"},"f64":{"ok":"8.0"}}},
++  {"text":"!!str 1","options":"reject non-finite","reads":{"typeless":{"ok":"String(\"1\")"},"string":{"ok":"\"1\""},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"error":"invalid i64 at line 1, column 7"},"u64":{"error":"invalid u64 at line 1, column 7"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"!!int \"5\"","options":"reject non-finite","reads":{"typeless":{"ok":"Number(5)"},"string":{"error":"cannot deserialize tagged scalar into string at line 1, column 7"},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"ok":"5"},"u64":{"ok":"5"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"!override 0","options":"reject non-finite","reads":{"typeless":{"ok":"Number(0)"},"string":{"ok":"\"0\""},"bool":{"error":"invalid boolean at line 1, column 11"},"i64":{"ok":"0"},"u64":{"ok":"0"},"f64":{"ok":"0.0"}}},
++  {"text":"-7","options":"reject non-finite","reads":{"typeless":{"ok":"Number(-7)"},"string":{"ok":"\"-7\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"-7"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"-7.0"}}},
++  {"text":"-0x10","options":"reject non-finite","reads":{"typeless":{"ok":"Number(-16)"},"string":{"ok":"\"-0x10\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"-16"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"1e999","options":"reject non-finite","reads":{"typeless":{"error":"non-finite float `1e999` rejected by the configured policy at line 1, column 1"},"string":{"ok":"\"1e999\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"-.inf","options":"reject non-finite","reads":{"typeless":{"error":"non-finite float `-.inf` rejected by the configured policy at line 1, column 1"},"string":{"ok":"\"-.inf\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"-inf"}}},
++  {"text":"!!binary aGVsbG8=","options":"reject non-finite","reads":{"typeless":{"ok":"String(\"hello\")"},"string":{"ok":"\"hello\""},"bool":{"error":"invalid boolean at line 1, column 10"},"i64":{"error":"invalid i64 at line 1, column 10"},"u64":{"error":"invalid u64 at line 1, column 10"},"f64":{"error":"invalid floating point at line 1, column 10"}}},
++  {"text":"!!float 1","options":"reject non-finite","reads":{"typeless":{"ok":"Number(1.0)"},"string":{"error":"cannot deserialize tagged scalar into string at line 1, column 9"},"bool":{"error":"invalid boolean at line 1, column 9"},"i64":{"error":"invalid i64 at line 1, column 9"},"u64":{"error":"invalid u64 at line 1, column 9"},"f64":{"ok":"1.0"}}},
++  {"text":"!!bool yes","options":"reject non-finite","reads":{"typeless":{"ok":"Bool(true)"},"string":{"error":"cannot deserialize tagged scalar into string at line 1, column 8"},"bool":{"ok":"true"},"i64":{"error":"invalid i64 at line 1, column 8"},"u64":{"error":"invalid u64 at line 1, column 8"},"f64":{"error":"invalid floating point at line 1, column 8"}}},
++  {"text":"!!null x","options":"reject non-finite","reads":{"typeless":{"ok":"Null"},"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 8"},"bool":{"error":"invalid boolean at line 1, column 8"},"i64":{"error":"invalid i64 at line 1, column 8"},"u64":{"error":"invalid u64 at line 1, column 8"},"f64":{"error":"invalid floating point at line 1, column 8"}}},
++  {"text":"!!int 8080","options":"reject non-finite","reads":{"typeless":{"ok":"Number(8080)"},"string":{"error":"cannot deserialize tagged scalar into string at line 1, column 7"},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"ok":"8080"},"u64":{"ok":"8080"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"!!int ~","options":"reject non-finite","reads":{"typeless":{"error":"invalid u64 at line 1, column 7"},"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 7"},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"error":"invalid i64 at line 1, column 7"},"u64":{"error":"invalid u64 at line 1, column 7"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"!!binary aGk=","options":"reject non-finite","reads":{"typeless":{"ok":"String(\"hi\")"},"string":{"ok":"\"hi\""},"bool":{"error":"invalid boolean at line 1, column 10"},"i64":{"error":"invalid i64 at line 1, column 10"},"u64":{"error":"invalid u64 at line 1, column 10"},"f64":{"error":"invalid floating point at line 1, column 10"}}},
++  {"text":"!!binary \"!!!\"","options":"reject non-finite","reads":{"typeless":{"error":"invalid !!binary base64 at line 1, column 10"},"string":{"error":"invalid !!binary base64 at line 1, column 10"},"bool":{"error":"invalid boolean at line 1, column 10"},"i64":{"error":"invalid i64 at line 1, column 10"},"u64":{"error":"invalid u64 at line 1, column 10"},"f64":{"error":"invalid floating point at line 1, column 10"}}},
++  {"text":"!!str ~","options":"reject non-finite","reads":{"typeless":{"ok":"String(\"~\")"},"string":{"ok":"\"~\""},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"error":"invalid i64 at line 1, column 7"},"u64":{"error":"invalid u64 at line 1, column 7"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"'~'","options":"reject non-finite","reads":{"typeless":{"ok":"String(\"~\")"},"string":{"ok":"\"~\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"1.10","options":"pass non-finite through","reads":{"typeless":{"ok":"Number(1.1)"},"string":{"ok":"\"1.10\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"1.1"}}},
++  {"text":"010","options":"pass non-finite through","reads":{"typeless":{"ok":"Number(10.0)"},"string":{"ok":"\"010\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"10.0"}}},
++  {"text":"0x10","options":"pass non-finite through","reads":{"typeless":{"ok":"Number(16)"},"string":{"ok":"\"0x10\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"16"},"u64":{"ok":"16"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"0o17","options":"pass non-finite through","reads":{"typeless":{"ok":"Number(15)"},"string":{"ok":"\"0o17\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"15"},"u64":{"ok":"15"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"0b101","options":"pass non-finite through","reads":{"typeless":{"ok":"Number(5)"},"string":{"ok":"\"0b101\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"5"},"u64":{"ok":"5"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"1e3","options":"pass non-finite through","reads":{"typeless":{"ok":"Number(1000.0)"},"string":{"ok":"\"1e3\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"1000.0"}}},
++  {"text":"+1","options":"pass non-finite through","reads":{"typeless":{"ok":"Number(1)"},"string":{"ok":"\"+1\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"1"},"u64":{"ok":"1"},"f64":{"ok":"1.0"}}},
++  {"text":"1_000","options":"pass non-finite through","reads":{"typeless":{"ok":"Number(1000)"},"string":{"ok":"\"1_000\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"1000"},"u64":{"ok":"1000"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":".inf","options":"pass non-finite through","reads":{"typeless":{"ok":"Null"},"string":{"ok":"\".inf\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"inf"}}},
++  {"text":".nan","options":"pass non-finite through","reads":{"typeless":{"ok":"Null"},"string":{"ok":"\".nan\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"NaN"}}},
++  {"text":"inf","options":"pass non-finite through","reads":{"typeless":{"ok":"String(\"inf\")"},"string":{"ok":"\"inf\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"True","options":"pass non-finite through","reads":{"typeless":{"ok":"Bool(true)"},"string":{"ok":"\"True\""},"bool":{"ok":"true"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"no","options":"pass non-finite through","reads":{"typeless":{"ok":"Bool(false)"},"string":{"ok":"\"no\""},"bool":{"ok":"false"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"~","options":"pass non-finite through","reads":{"typeless":{"ok":"Null"},"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 1"},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"null","options":"pass non-finite through","reads":{"typeless":{"ok":"Null"},"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 1"},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"","options":"pass non-finite through","reads":{"typeless":{"ok":"Null"},"string":{"error":"unexpected end of input at line 1, column 1"},"bool":{"error":"unexpected end of input at line 1, column 1"},"i64":{"error":"unexpected end of input at line 1, column 1"},"u64":{"error":"unexpected end of input at line 1, column 1"},"f64":{"error":"unexpected end of input at line 1, column 1"}},"rules":{"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 1"},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"'null'","options":"pass non-finite through","reads":{"typeless":{"ok":"String(\"null\")"},"string":{"ok":"\"null\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"\"8\"","options":"pass non-finite through","reads":{"typeless":{"ok":"String(\"8\")"},"string":{"ok":"\"8\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"8"},"u64":{"ok":"8"},"f64":{"ok":"8.0"}}},
++  {"text":"!!str 1","options":"pass non-finite through","reads":{"typeless":{"ok":"String(\"1\")"},"string":{"ok":"\"1\""},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"error":"invalid i64 at line 1, column 7"},"u64":{"error":"invalid u64 at line 1, column 7"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"!!int \"5\"","options":"pass non-finite through","reads":{"typeless":{"ok":"Number(5)"},"string":{"error":"cannot deserialize tagged scalar into string at line 1, column 7"},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"ok":"5"},"u64":{"ok":"5"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"!override 0","options":"pass non-finite through","reads":{"typeless":{"ok":"Number(0)"},"string":{"ok":"\"0\""},"bool":{"error":"invalid boolean at line 1, column 11"},"i64":{"ok":"0"},"u64":{"ok":"0"},"f64":{"ok":"0.0"}}},
++  {"text":"-7","options":"pass non-finite through","reads":{"typeless":{"ok":"Number(-7)"},"string":{"ok":"\"-7\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"-7"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"-7.0"}}},
++  {"text":"-0x10","options":"pass non-finite through","reads":{"typeless":{"ok":"Number(-16)"},"string":{"ok":"\"-0x10\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"-16"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"1e999","options":"pass non-finite through","reads":{"typeless":{"ok":"Null"},"string":{"ok":"\"1e999\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"-.inf","options":"pass non-finite through","reads":{"typeless":{"ok":"Null"},"string":{"ok":"\"-.inf\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"-inf"}}},
++  {"text":"!!binary aGVsbG8=","options":"pass non-finite through","reads":{"typeless":{"ok":"String(\"hello\")"},"string":{"ok":"\"hello\""},"bool":{"error":"invalid boolean at line 1, column 10"},"i64":{"error":"invalid i64 at line 1, column 10"},"u64":{"error":"invalid u64 at line 1, column 10"},"f64":{"error":"invalid floating point at line 1, column 10"}}},
++  {"text":"!!float 1","options":"pass non-finite through","reads":{"typeless":{"ok":"Number(1.0)"},"string":{"error":"cannot deserialize tagged scalar into string at line 1, column 9"},"bool":{"error":"invalid boolean at line 1, column 9"},"i64":{"error":"invalid i64 at line 1, column 9"},"u64":{"error":"invalid u64 at line 1, column 9"},"f64":{"ok":"1.0"}}},
++  {"text":"!!bool yes","options":"pass non-finite through","reads":{"typeless":{"ok":"Bool(true)"},"string":{"error":"cannot deserialize tagged scalar into string at line 1, column 8"},"bool":{"ok":"true"},"i64":{"error":"invalid i64 at line 1, column 8"},"u64":{"error":"invalid u64 at line 1, column 8"},"f64":{"error":"invalid floating point at line 1, column 8"}}},
++  {"text":"!!null x","options":"pass non-finite through","reads":{"typeless":{"ok":"Null"},"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 8"},"bool":{"error":"invalid boolean at line 1, column 8"},"i64":{"error":"invalid i64 at line 1, column 8"},"u64":{"error":"invalid u64 at line 1, column 8"},"f64":{"error":"invalid floating point at line 1, column 8"}}},
++  {"text":"!!int 8080","options":"pass non-finite through","reads":{"typeless":{"ok":"Number(8080)"},"string":{"error":"cannot deserialize tagged scalar into string at line 1, column 7"},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"ok":"8080"},"u64":{"ok":"8080"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"!!int ~","options":"pass non-finite through","reads":{"typeless":{"error":"invalid u64 at line 1, column 7"},"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 7"},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"error":"invalid i64 at line 1, column 7"},"u64":{"error":"invalid u64 at line 1, column 7"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"!!binary aGk=","options":"pass non-finite through","reads":{"typeless":{"ok":"String(\"hi\")"},"string":{"ok":"\"hi\""},"bool":{"error":"invalid boolean at line 1, column 10"},"i64":{"error":"invalid i64 at line 1, column 10"},"u64":{"error":"invalid u64 at line 1, column 10"},"f64":{"error":"invalid floating point at line 1, column 10"}}},
++  {"text":"!!binary \"!!!\"","options":"pass non-finite through","reads":{"typeless":{"error":"invalid !!binary base64 at line 1, column 10"},"string":{"error":"invalid !!binary base64 at line 1, column 10"},"bool":{"error":"invalid boolean at line 1, column 10"},"i64":{"error":"invalid i64 at line 1, column 10"},"u64":{"error":"invalid u64 at line 1, column 10"},"f64":{"error":"invalid floating point at line 1, column 10"}}},
++  {"text":"!!str ~","options":"pass non-finite through","reads":{"typeless":{"ok":"String(\"~\")"},"string":{"ok":"\"~\""},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"error":"invalid i64 at line 1, column 7"},"u64":{"error":"invalid u64 at line 1, column 7"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"'~'","options":"pass non-finite through","reads":{"typeless":{"ok":"String(\"~\")"},"string":{"ok":"\"~\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"1.10","options":"ignore the binary tag","reads":{"typeless":{"ok":"Number(1.1)"},"string":{"ok":"\"1.10\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"1.1"}}},
++  {"text":"010","options":"ignore the binary tag","reads":{"typeless":{"ok":"Number(10.0)"},"string":{"ok":"\"010\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"10.0"}}},
++  {"text":"0x10","options":"ignore the binary tag","reads":{"typeless":{"ok":"Number(16)"},"string":{"ok":"\"0x10\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"16"},"u64":{"ok":"16"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"0o17","options":"ignore the binary tag","reads":{"typeless":{"ok":"Number(15)"},"string":{"ok":"\"0o17\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"15"},"u64":{"ok":"15"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"0b101","options":"ignore the binary tag","reads":{"typeless":{"ok":"Number(5)"},"string":{"ok":"\"0b101\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"5"},"u64":{"ok":"5"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"1e3","options":"ignore the binary tag","reads":{"typeless":{"ok":"Number(1000.0)"},"string":{"ok":"\"1e3\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"1000.0"}}},
++  {"text":"+1","options":"ignore the binary tag","reads":{"typeless":{"ok":"Number(1)"},"string":{"ok":"\"+1\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"1"},"u64":{"ok":"1"},"f64":{"ok":"1.0"}}},
++  {"text":"1_000","options":"ignore the binary tag","reads":{"typeless":{"ok":"Number(1000)"},"string":{"ok":"\"1_000\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"1000"},"u64":{"ok":"1000"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":".inf","options":"ignore the binary tag","reads":{"typeless":{"error":"non-finite float `.inf` rejected by the configured policy at line 1, column 1"},"string":{"ok":"\".inf\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"inf"}}},
++  {"text":".nan","options":"ignore the binary tag","reads":{"typeless":{"error":"non-finite float `.nan` rejected by the configured policy at line 1, column 1"},"string":{"ok":"\".nan\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"NaN"}}},
++  {"text":"inf","options":"ignore the binary tag","reads":{"typeless":{"ok":"String(\"inf\")"},"string":{"ok":"\"inf\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"True","options":"ignore the binary tag","reads":{"typeless":{"ok":"Bool(true)"},"string":{"ok":"\"True\""},"bool":{"ok":"true"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"no","options":"ignore the binary tag","reads":{"typeless":{"ok":"Bool(false)"},"string":{"ok":"\"no\""},"bool":{"ok":"false"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"~","options":"ignore the binary tag","reads":{"typeless":{"ok":"Null"},"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 1"},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"null","options":"ignore the binary tag","reads":{"typeless":{"ok":"Null"},"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 1"},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"","options":"ignore the binary tag","reads":{"typeless":{"ok":"Null"},"string":{"error":"unexpected end of input at line 1, column 1"},"bool":{"error":"unexpected end of input at line 1, column 1"},"i64":{"error":"unexpected end of input at line 1, column 1"},"u64":{"error":"unexpected end of input at line 1, column 1"},"f64":{"error":"unexpected end of input at line 1, column 1"}},"rules":{"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 1"},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"'null'","options":"ignore the binary tag","reads":{"typeless":{"ok":"String(\"null\")"},"string":{"ok":"\"null\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"\"8\"","options":"ignore the binary tag","reads":{"typeless":{"ok":"String(\"8\")"},"string":{"ok":"\"8\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"8"},"u64":{"ok":"8"},"f64":{"ok":"8.0"}}},
++  {"text":"!!str 1","options":"ignore the binary tag","reads":{"typeless":{"ok":"String(\"1\")"},"string":{"ok":"\"1\""},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"error":"invalid i64 at line 1, column 7"},"u64":{"error":"invalid u64 at line 1, column 7"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"!!int \"5\"","options":"ignore the binary tag","reads":{"typeless":{"ok":"Number(5)"},"string":{"error":"cannot deserialize tagged scalar into string at line 1, column 7"},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"ok":"5"},"u64":{"ok":"5"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"!override 0","options":"ignore the binary tag","reads":{"typeless":{"ok":"Number(0)"},"string":{"ok":"\"0\""},"bool":{"error":"invalid boolean at line 1, column 11"},"i64":{"ok":"0"},"u64":{"ok":"0"},"f64":{"ok":"0.0"}}},
++  {"text":"-7","options":"ignore the binary tag","reads":{"typeless":{"ok":"Number(-7)"},"string":{"ok":"\"-7\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"-7"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"-7.0"}}},
++  {"text":"-0x10","options":"ignore the binary tag","reads":{"typeless":{"ok":"Number(-16)"},"string":{"ok":"\"-0x10\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"ok":"-16"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"1e999","options":"ignore the binary tag","reads":{"typeless":{"error":"non-finite float `1e999` rejected by the configured policy at line 1, column 1"},"string":{"ok":"\"1e999\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}},
++  {"text":"-.inf","options":"ignore the binary tag","reads":{"typeless":{"error":"non-finite float `-.inf` rejected by the configured policy at line 1, column 1"},"string":{"ok":"\"-.inf\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"ok":"-inf"}}},
++  {"text":"!!binary aGVsbG8=","options":"ignore the binary tag","reads":{"typeless":{"ok":"String(\"aGVsbG8=\")"},"string":{"ok":"\"aGVsbG8=\""},"bool":{"error":"invalid boolean at line 1, column 10"},"i64":{"error":"invalid i64 at line 1, column 10"},"u64":{"error":"invalid u64 at line 1, column 10"},"f64":{"error":"invalid floating point at line 1, column 10"}}},
++  {"text":"!!float 1","options":"ignore the binary tag","reads":{"typeless":{"ok":"Number(1.0)"},"string":{"error":"cannot deserialize tagged scalar into string at line 1, column 9"},"bool":{"error":"invalid boolean at line 1, column 9"},"i64":{"error":"invalid i64 at line 1, column 9"},"u64":{"error":"invalid u64 at line 1, column 9"},"f64":{"ok":"1.0"}}},
++  {"text":"!!bool yes","options":"ignore the binary tag","reads":{"typeless":{"ok":"Bool(true)"},"string":{"error":"cannot deserialize tagged scalar into string at line 1, column 8"},"bool":{"ok":"true"},"i64":{"error":"invalid i64 at line 1, column 8"},"u64":{"error":"invalid u64 at line 1, column 8"},"f64":{"error":"invalid floating point at line 1, column 8"}}},
++  {"text":"!!null x","options":"ignore the binary tag","reads":{"typeless":{"ok":"Null"},"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 8"},"bool":{"error":"invalid boolean at line 1, column 8"},"i64":{"error":"invalid i64 at line 1, column 8"},"u64":{"error":"invalid u64 at line 1, column 8"},"f64":{"error":"invalid floating point at line 1, column 8"}}},
++  {"text":"!!int 8080","options":"ignore the binary tag","reads":{"typeless":{"ok":"Number(8080)"},"string":{"error":"cannot deserialize tagged scalar into string at line 1, column 7"},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"ok":"8080"},"u64":{"ok":"8080"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"!!int ~","options":"ignore the binary tag","reads":{"typeless":{"error":"invalid u64 at line 1, column 7"},"string":{"error":"cannot deserialize null into string; use Option<String> at line 1, column 7"},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"error":"invalid i64 at line 1, column 7"},"u64":{"error":"invalid u64 at line 1, column 7"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"!!binary aGk=","options":"ignore the binary tag","reads":{"typeless":{"ok":"String(\"aGk=\")"},"string":{"ok":"\"aGk=\""},"bool":{"error":"invalid boolean at line 1, column 10"},"i64":{"error":"invalid i64 at line 1, column 10"},"u64":{"error":"invalid u64 at line 1, column 10"},"f64":{"error":"invalid floating point at line 1, column 10"}}},
++  {"text":"!!binary \"!!!\"","options":"ignore the binary tag","reads":{"typeless":{"ok":"String(\"!!!\")"},"string":{"ok":"\"!!!\""},"bool":{"error":"invalid boolean at line 1, column 10"},"i64":{"error":"invalid i64 at line 1, column 10"},"u64":{"error":"invalid u64 at line 1, column 10"},"f64":{"error":"invalid floating point at line 1, column 10"}}},
++  {"text":"!!str ~","options":"ignore the binary tag","reads":{"typeless":{"ok":"String(\"~\")"},"string":{"ok":"\"~\""},"bool":{"error":"invalid boolean at line 1, column 7"},"i64":{"error":"invalid i64 at line 1, column 7"},"u64":{"error":"invalid u64 at line 1, column 7"},"f64":{"error":"invalid floating point at line 1, column 7"}}},
++  {"text":"'~'","options":"ignore the binary tag","reads":{"typeless":{"ok":"String(\"~\")"},"string":{"ok":"\"~\""},"bool":{"error":"invalid boolean at line 1, column 1"},"i64":{"error":"invalid i64 at line 1, column 1"},"u64":{"error":"invalid u64 at line 1, column 1"},"f64":{"error":"invalid floating point at line 1, column 1"}}}
++]
+diff --git a/tests/public_scalars.rs b/tests/public_scalars.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..51bd33b031b689104f2db2ec3afece0e9e72facf
+--- /dev/null
++++ b/tests/public_scalars.rs
+@@ -0,0 +1,458 @@
++//! Tests for [serde_saphyr::scalars]: each rule answers as [from_str_with_options] did before
++//! the rules were made public.
++//!
++//! `fixtures/public_scalars.json` records what `from_str_with_options` returned for every row
++//! under every option set, from the commit below the located reader and the scalar rules. Both
++//! the deserializer and [Rules] are checked against that record, so a change to a rule that the
++//! deserializer shares fails here instead of moving both sides together.
++
++use std::borrow::Cow;
++use std::collections::BTreeMap;
++use std::fmt::Debug;
++
++use serde::Deserialize;
++use serde_json::{Number, Value};
++use serde_saphyr::granit_parser::ScalarStyle;
++use serde_saphyr::located::{self, Node};
++use serde_saphyr::scalars::{Inferred, Rules, Scalar};
++use serde_saphyr::{
++    Error, Location, NonFiniteFloatPolicy, Options, from_str_with_options, options,
++};
++
++/// The YAML text of every row whose answer is pinned against the deserializer.
++const ROWS: &[&str] = &[
++    "1.10",
++    "010",
++    "0x10",
++    "0o17",
++    "0b101",
++    "1e3",
++    "+1",
++    "1_000",
++    ".inf",
++    ".nan",
++    "inf",
++    "True",
++    "no",
++    "~",
++    "null",
++    "",
++    "'null'",
++    "\"8\"",
++    "!!str 1",
++    "!!int \"5\"",
++    "!override 0",
++    "-7",
++    "-0x10",
++    "1e999",
++    "-.inf",
++    "!!binary aGVsbG8=",
++    "!!float 1",
++    "!!bool yes",
++    "!!null x",
++    "!!int 8080",
++    "!!int ~",
++    "!!binary aGk=",
++    "!!binary \"!!!\"",
++    "!!str ~",
++    "'~'",
++];
++
++fn option_sets() -> Vec<(&'static str, Options)> {
++    vec![
++        ("default", options! { with_snippet: false }),
++        (
++            "strict_booleans",
++            options! { with_snippet: false, strict_booleans: true },
++        ),
++        (
++            "legacy_octal_numbers",
++            options! { with_snippet: false, legacy_octal_numbers: true },
++        ),
++        (
++            "leading_zero_numbers_as_strings",
++            options! { with_snippet: false, leading_zero_numbers_as_strings: true },
++        ),
++        (
++            "underscored_numbers_as_strings",
++            options! { with_snippet: false, underscored_numbers_as_strings: true },
++        ),
++        (
++            "reject non-finite",
++            options! { with_snippet: false, non_finite_float_policy: NonFiniteFloatPolicy::Reject },
++        ),
++        (
++            "pass non-finite through",
++            options! {
++                with_snippet: false,
++                non_finite_float_policy: NonFiniteFloatPolicy::PassThrough,
++            },
++        ),
++        (
++            "ignore the binary tag",
++            options! { with_snippet: false, ignore_binary_tag_for_string: true },
++        ),
++    ]
++}
++
++fn read_scalar(text: &str) -> (String, ScalarStyle, Option<String>, Location) {
++    match located::read(text, Options::default()).expect("the row reads") {
++        Node::Scalar(scalar) => (
++            scalar.value,
++            scalar.style,
++            scalar.tag,
++            scalar.locations.defined_location,
++        ),
++        other => panic!("{text:?} is not a scalar: {other:?}"),
++    }
++}
++
++/// What one read gave: the `Debug` text of the value, or the `Display` text of the error.
++#[derive(Debug, PartialEq, Eq, Deserialize)]
++enum Answer {
++    #[serde(rename = "ok")]
++    Read(String),
++    #[serde(rename = "error")]
++    Refused(String),
++}
++
++fn answer<T: Debug>(result: Result<T, Error>) -> Answer {
++    match result {
++        Ok(value) => Answer::Read(format!("{value:?}")),
++        Err(error) => Answer::Refused(error.to_string()),
++    }
++}
++
++/// One row under one option set: the reads `from_str_with_options` gave, by type name, and the
++/// reads where [Rules] words its answer differently by design.
++#[derive(Deserialize)]
++struct Recorded {
++    text: String,
++    options: String,
++    reads: BTreeMap<String, Answer>,
++    #[serde(default)]
++    rules: BTreeMap<String, Answer>,
++}
++
++impl Recorded {
++    fn deserializer(&self, read: &str) -> &Answer {
++        &self.reads[read]
++    }
++
++    fn rules(&self, read: &str) -> &Answer {
++        self.rules
++            .get(read)
++            .unwrap_or_else(|| self.deserializer(read))
++    }
++}
++
++fn recorded() -> Vec<Recorded> {
++    serde_json::from_str(include_str!("fixtures/public_scalars.json"))
++        .expect("the fixture is valid")
++}
++
++/// Every row under every option set, with its record.
++fn each_row(mut check: impl FnMut(&str, &str, &Options, &Recorded)) {
++    let recorded = recorded();
++    for (name, options) in option_sets() {
++        for text in ROWS {
++            let row = recorded
++                .iter()
++                .find(|row| row.text == *text && row.options == name)
++                .unwrap_or_else(|| panic!("no record of {text:?} under {name}"));
++            check(text, name, &options, row);
++        }
++    }
++}
++
++fn to_json(inferred: Inferred<'_>) -> Value {
++    match inferred {
++        Inferred::Null => Value::Null,
++        Inferred::Bool(value) => Value::Bool(value),
++        Inferred::Signed(value) => Value::Number(value.into()),
++        Inferred::Unsigned(value) => Value::Number(value.into()),
++        // serde_json's own visitor turns a non-finite float into null.
++        Inferred::Float(value) => Number::from_f64(value).map_or(Value::Null, Value::Number),
++        Inferred::String(value) => Value::String(value.into_owned()),
++    }
++}
++
++#[test]
++fn the_deserializer_answers_as_recorded_for_every_row_and_option_set() {
++    each_row(|text, name, options, row| {
++        let reads = [
++            (
++                "typeless",
++                answer(from_str_with_options::<Value>(text, options.clone())),
++            ),
++            (
++                "string",
++                answer(from_str_with_options::<String>(text, options.clone())),
++            ),
++            (
++                "bool",
++                answer(from_str_with_options::<bool>(text, options.clone())),
++            ),
++            (
++                "i64",
++                answer(from_str_with_options::<i64>(text, options.clone())),
++            ),
++            (
++                "u64",
++                answer(from_str_with_options::<u64>(text, options.clone())),
++            ),
++            (
++                "f64",
++                answer(from_str_with_options::<f64>(text, options.clone())),
++            ),
++        ];
++        for (read, got) in reads {
++            assert_eq!(
++                &got,
++                row.deserializer(read),
++                "{text:?} as {read} under {name}"
++            );
++        }
++    });
++}
++
++/// The rules answer as the record says for every read they offer. The empty row is the one place
++/// the wording differs by design, under every option set: the deserializer reads an empty input
++/// as a document with no node, so a typed read of it fails with "unexpected end of input", while
++/// the rules answer for a scalar that exists and is empty, and fail with the error of the type
++/// they were asked for. The fixture records the rules' wording under `rules`.
++#[test]
++fn rules_answer_as_recorded_for_every_row_and_option_set() {
++    each_row(|text, name, options, row| {
++        let rules = Rules::new(options);
++        let (value, style, tag, location) = read_scalar(text);
++        let scalar = Scalar {
++            value: &value,
++            style,
++            tag: tag.as_deref(),
++        };
++        let reads = [
++            (
++                "typeless",
++                answer(rules.infer(&scalar, location).map(to_json)),
++            ),
++            ("string", answer(rules.string(&scalar, location))),
++            ("bool", answer(rules.boolean(&scalar, location))),
++            ("i64", answer(rules.signed::<i64>(&scalar, location))),
++            ("u64", answer(rules.unsigned::<u64>(&scalar, location))),
++            ("f64", answer(rules.float64(&scalar, location))),
++        ];
++        for (read, got) in reads {
++            assert_eq!(&got, row.rules(read), "{text:?} as {read} under {name}");
++        }
++    });
++}
++
++#[test]
++fn string_borrows_unchanged_text_and_owns_decoded_binary() {
++    let rules = Rules::new(&Options::default());
++    let read = |text: &str, check: &dyn Fn(Cow<'_, str>)| {
++        let (value, style, tag, location) = read_scalar(text);
++        let scalar = Scalar {
++            value: &value,
++            style,
++            tag: tag.as_deref(),
++        };
++        check(
++            rules
++                .string(&scalar, location)
++                .expect("the row reads as text"),
++        );
++    };
++    read("plain", &|text| {
++        assert!(matches!(text, Cow::Borrowed("plain")))
++    });
++    read("'~'", &|text| assert!(matches!(text, Cow::Borrowed("~"))));
++    read("!!str ~", &|text| {
++        assert!(matches!(text, Cow::Borrowed("~")))
++    });
++    read("!!binary aGk=", &|text| {
++        assert!(matches!(text, Cow::Owned(ref owned) if owned == "hi"));
++    });
++}
++
++#[test]
++fn infer_answers_the_pinned_rows() {
++    let rules = Rules::new(&options! {
++        non_finite_float_policy: NonFiniteFloatPolicy::AsString,
++    });
++    let infer = |text: &str| {
++        let (value, style, tag, location) = read_scalar(text);
++        let scalar = Scalar {
++            value: &value,
++            style,
++            tag: tag.as_deref(),
++        };
++        rules.infer(&scalar, location).map(to_json)
++    };
++    let string = |text: &str| Value::String(text.to_owned());
++    assert_eq!(infer("1.10").unwrap(), serde_json::json!(1.1));
++    assert_eq!(infer("010").unwrap(), serde_json::json!(10.0));
++    assert_eq!(infer("0x10").unwrap(), serde_json::json!(16));
++    assert_eq!(infer("0o17").unwrap(), serde_json::json!(15));
++    assert_eq!(infer("0b101").unwrap(), serde_json::json!(5));
++    assert_eq!(infer("1e3").unwrap(), serde_json::json!(1000.0));
++    assert_eq!(infer("+1").unwrap(), serde_json::json!(1));
++    assert_eq!(infer("1_000").unwrap(), serde_json::json!(1000));
++    assert_eq!(infer(".inf").unwrap(), string(".inf"));
++    assert_eq!(infer(".nan").unwrap(), string(".nan"));
++    assert_eq!(infer("inf").unwrap(), string("inf"));
++    assert_eq!(infer("True").unwrap(), Value::Bool(true));
++    assert_eq!(infer("no").unwrap(), Value::Bool(false));
++    assert_eq!(infer("~").unwrap(), Value::Null);
++    assert_eq!(infer("null").unwrap(), Value::Null);
++    assert_eq!(infer("").unwrap(), Value::Null);
++    assert_eq!(infer("'null'").unwrap(), string("null"));
++    assert_eq!(infer("\"8\"").unwrap(), string("8"));
++    assert_eq!(infer("!!str 1").unwrap(), string("1"));
++    assert_eq!(infer("!!int \"5\"").unwrap(), serde_json::json!(5));
++    assert_eq!(infer("!override 0").unwrap(), serde_json::json!(0));
++}
++
++macro_rules! typed_rows {
++    ($($test:ident: $method:ident::<$ty:ty>),* $(,)?) => {$(
++        #[test]
++        fn $test() {
++            for (name, options) in option_sets() {
++                let rules = Rules::new(&options);
++                for text in ROWS {
++                    let (value, style, tag, location) = read_scalar(text);
++                    let scalar = Scalar { value: &value, style, tag: tag.as_deref() };
++                    let rule = rules.$method::<$ty>(&scalar, location);
++                    let deserialized = from_str_with_options::<$ty>(text, options.clone());
++                    match (rule, deserialized) {
++                        (Ok(rule), Ok(deserialized)) => assert_eq!(
++                            format!("{rule:?}"),
++                            format!("{deserialized:?}"),
++                            "{text:?} as {} under {name}",
++                            stringify!($ty),
++                        ),
++                        (Err(_), Err(_)) => {}
++                        (rule, deserialized) => panic!(
++                            "{text:?} as {} under {name}: {rule:?} against {deserialized:?}",
++                            stringify!($ty),
++                        ),
++                    }
++                }
++            }
++        }
++    )*};
++}
++
++macro_rules! float_rows {
++    ($($test:ident: $method:ident -> $ty:ty),* $(,)?) => {$(
++        #[test]
++        fn $test() {
++            for (name, options) in option_sets() {
++                let rules = Rules::new(&options);
++                for text in ROWS {
++                    let (value, style, tag, location) = read_scalar(text);
++                    let scalar = Scalar { value: &value, style, tag: tag.as_deref() };
++                    let rule = rules.$method(&scalar, location);
++                    let deserialized = from_str_with_options::<$ty>(text, options.clone());
++                    match (rule, deserialized) {
++                        (Ok(rule), Ok(deserialized)) => assert_eq!(
++                            format!("{rule:?}"),
++                            format!("{deserialized:?}"),
++                            "{text:?} as {} under {name}",
++                            stringify!($ty),
++                        ),
++                        (Err(_), Err(_)) => {}
++                        (rule, deserialized) => panic!(
++                            "{text:?} as {} under {name}: {rule:?} against {deserialized:?}",
++                            stringify!($ty),
++                        ),
++                    }
++                }
++            }
++        }
++    )*};
++}
++
++typed_rows! {
++    signed_i8_matches_the_deserializer: signed::<i8>,
++    signed_i16_matches_the_deserializer: signed::<i16>,
++    signed_i32_matches_the_deserializer: signed::<i32>,
++    signed_i128_matches_the_deserializer: signed::<i128>,
++    unsigned_u8_matches_the_deserializer: unsigned::<u8>,
++    unsigned_u16_matches_the_deserializer: unsigned::<u16>,
++    unsigned_u32_matches_the_deserializer: unsigned::<u32>,
++    unsigned_u128_matches_the_deserializer: unsigned::<u128>,
++}
++
++float_rows! {
++    float32_matches_the_deserializer: float32 -> f32,
++}
++
++#[test]
++fn typed_answers_for_the_pinned_rows() {
++    let rules = Rules::new(&Options::default());
++    let answers = |text: &str| {
++        let (value, style, tag, location) = read_scalar(text);
++        let scalar = Scalar {
++            value: &value,
++            style,
++            tag: tag.as_deref(),
++        };
++        (
++            rules.signed::<i64>(&scalar, location).ok(),
++            rules.unsigned::<u64>(&scalar, location).ok(),
++            rules.float64(&scalar, location).ok(),
++            rules.boolean(&scalar, location).ok(),
++        )
++    };
++    assert_eq!(answers("1.10"), (None, None, Some(1.1), None));
++    assert_eq!(answers("010"), (None, None, Some(10.0), None));
++    assert_eq!(answers("0x10"), (Some(16), Some(16), None, None));
++    assert_eq!(answers("0o17"), (Some(15), Some(15), None, None));
++    assert_eq!(answers("0b101"), (Some(5), Some(5), None, None));
++    assert_eq!(answers("1e3"), (None, None, Some(1000.0), None));
++    assert_eq!(answers("+1"), (Some(1), Some(1), Some(1.0), None));
++    assert_eq!(answers("1_000"), (Some(1000), Some(1000), None, None));
++    assert_eq!(answers("True"), (None, None, None, Some(true)));
++    assert_eq!(answers("no"), (None, None, None, Some(false)));
++    assert_eq!(answers("!!int \"5\""), (Some(5), Some(5), None, None));
++    assert_eq!(answers("!override 0"), (Some(0), Some(0), Some(0.0), None));
++    assert_eq!(answers("!!str 1"), (None, None, None, None));
++    assert_eq!(answers("inf"), (None, None, None, None));
++    assert_eq!(answers(".inf").2, Some(f64::INFINITY));
++    assert!(answers(".nan").2.is_some_and(f64::is_nan));
++}
++
++#[test]
++fn is_null_agrees_with_the_recorded_typeless_null() {
++    each_row(|text, name, options, row| {
++        if name != "default" {
++            return;
++        }
++        let rules = Rules::new(options);
++        let (value, style, tag, _) = read_scalar(text);
++        let scalar = Scalar {
++            value: &value,
++            style,
++            tag: tag.as_deref(),
++        };
++        let null = *row.deserializer("typeless") == Answer::Read("Null".to_owned());
++        assert_eq!(rules.is_null(&scalar), null, "{text:?}");
++    });
++    let rules = Rules::new(&Options::default());
++    let is_null = |text: &str| {
++        let (value, style, tag, _) = read_scalar(text);
++        rules.is_null(&Scalar {
++            value: &value,
++            style,
++            tag: tag.as_deref(),
++        })
++    };
++    assert!(is_null("~"));
++    assert!(is_null("null"));
++    assert!(is_null(""));
++    assert!(!is_null("'null'"));
++    assert!(!is_null("!!str"));
++    assert!(!is_null("no"));
++}
