@@ -1483,6 +1483,12 @@ impl Error {
         }
     }
 
+    /// The message `Display` writes for an error without a snippet wrapper, built without the
+    /// snippet renderer.
+    pub(crate) fn plain_message(&self) -> String {
+        PlainDisplay(self).to_string()
+    }
+
     /// Whether a persistent interpolation-budget breach ended this operation,
     /// including errors wrapped with alias locations or source snippets.
     pub(crate) fn is_property_interpolation_budget_breach(&self) -> bool {
@@ -2141,6 +2147,23 @@ fn writeln_anchor_intro(
     match line.strip_prefix("  |") {
         Some(rest) => writeln!(f, "{prefix}{rest}"),
         None => writeln!(f, "{line}"),
+    }
+}
+
+/// Writes an error through the plain path alone, with the default formatter and no line offset.
+///
+/// For an error without a snippet wrapper this is the text `Display` writes, but the snippet
+/// renderer is never called, so a caller that needs only the message does not link it.
+struct PlainDisplay<'a>(&'a Error);
+
+impl fmt::Display for PlainDisplay<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt_error_plain_with_formatter(
+            f,
+            self.0,
+            &crate::message_formatters::DefaultMessageFormatter,
+            0,
+        )
     }
 }
 

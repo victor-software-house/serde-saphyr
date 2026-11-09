@@ -131,7 +131,7 @@ pub(super) fn attach_alias_locations_if_missing(
             return err;
         }
         Error::AliasError {
-            msg: err.to_string(),
+            msg: err.plain_message(),
             error: Box::new(err),
             locations: Locations {
                 reference_location,
