@@ -1,0 +1,10 @@
+vsh-serde-saphyr
+Copyright (c) 2026 Victor Software House
+
+This crate is a fork of serde-saphyr,
+https://github.com/bourumir-wyngs/serde-saphyr,
+copyright the serde-saphyr contributors.
+Victor Software House maintains the downstream patches listed in PATCHES.md.
+
+The fork and its patches are licensed under the same terms as serde-saphyr:
+MIT (LICENSE-MIT) or Apache License 2.0 (LICENSE-APACHE), at your option.
