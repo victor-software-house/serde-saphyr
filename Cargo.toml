@@ -1,16 +1,20 @@
 [package]
-name = "serde-saphyr"
-version = "2.1.1"
+name = "vsh-serde-saphyr"
+version = "0.0.2"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
-description = "YAML (de)serializer for Serde, emphasizing panic-free parsing, fast builds and good error reporting. Supports properties, include, tag and comment capture"
-documentation = "https://docs.rs/serde-saphyr/latest/serde-saphyr/"
-repository = "https://github.com/bourumir-wyngs/serde-saphyr"
+description = "A fork of serde-saphyr with downstream patches, imported as serde_saphyr. YAML (de)serializer for Serde, emphasizing panic-free parsing, fast builds and good error reporting. Supports properties, include, tag and comment capture"
+documentation = "https://docs.rs/vsh-serde-saphyr"
+repository = "https://github.com/victor-software-house/serde-saphyr"
 readme = "README.md"
 categories = ["encoding", "parser-implementations", "config", "command-line-utilities"]
 keywords = ["yaml", "serde", "config", "ros", "wasm"]
-exclude = ["Cargo.lock", ".github/**", ".idea/**"]
+exclude = ["Cargo.lock", ".github/**", ".idea/**", ".changeset/**", ".ctl/**", "mise*.toml", "mise*.lock", "patches/**"]
+
+# The library keeps its upstream name, so `use serde_saphyr::...` works unchanged.
+[lib]
+name = "serde_saphyr"
 
 [dependencies]
 # granit-parser = { version = "2.0.0", git = "https://github.com/bourumir-wyngs/granit-parser", optional = true, default-features = false, features = ["std", "error_messages"] }
@@ -109,6 +113,7 @@ status = "actively developed"
 
 [[bin]]
 name = "serde-saphyr"
+path = "src/main.rs"
 required-features = ["serialize", "deserialize", "include", "include_fs"]
 
 [[example]]
