@@ -180,6 +180,15 @@ fn remembers_seen_keys(cfg: &Cfg) -> bool {
         || cfg.merge_keys == MergeKeyPolicy::Merge
 }
 
+/// Whether `err` is the type error that Serde's `&str` visitor returns for an owned string.
+///
+/// That visitor accepts only borrowed input, and its `expecting` text is "a borrowed string".
+/// The test reads the variant and its `expected` field. It never calls `Display` on the error,
+/// which would run the snippet renderer.
+fn is_borrowed_str_mismatch(err: &Error) -> bool {
+    matches!(err, Error::SerdeInvalidType { expected, .. } if expected == "a borrowed string")
+}
+
 /// Whether `V` is Serde's private visitor for buffering an arbitrary value as
 /// `Content`, as used by `#[serde(untagged)]` and `#[serde(flatten)]`.
 ///
@@ -1267,7 +1276,7 @@ impl<'de> de::Deserializer<'de> for YamlDeserializer<'de, '_> {
                         visitor.visit_string(self.take_string_scalar()?);
                     return match res {
                         Ok(v) => Ok(v),
-                        Err(err) if err.to_string().contains("expected a borrowed string") => Err(
+                        Err(err) if is_borrowed_str_mismatch(&err) => Err(
                             Error::cannot_borrow_transformed(TransformReason::ParserReturnedOwned)
                                 .with_location(view.location),
                         ),
@@ -1313,14 +1322,10 @@ impl<'de> de::Deserializer<'de> for YamlDeserializer<'de, '_> {
         });
         match res {
             Ok(v) => Ok(v),
-            Err(err) => {
-                let msg = err.to_string();
-                if msg.contains("expected a borrowed string") {
-                    return Err(Error::cannot_borrow_transformed(cannot_borrow_reason)
-                        .with_location(location));
-                }
-                Err(err)
+            Err(err) if is_borrowed_str_mismatch(&err) => {
+                Err(Error::cannot_borrow_transformed(cannot_borrow_reason).with_location(location))
             }
+            Err(err) => Err(err),
         }
     }
 
