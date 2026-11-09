@@ -1,0 +1,158 @@
+match-borrow-error-variant
+
+From: Victor Araújo <victor@victor-software-house.com>
+
+Downstream-Reason: Recognize the error that the &str visitor returns for an owned string by its variant and expected text instead of its Display text. Display runs the snippet renderer, so the text test linked annotate-snippets into every binary that derives a struct with string keys.
+Upstream-Status: not-submitted
+Drop-When: Upstream serde-saphyr deserialize_str stops calling Display on a visitor error.
+---
+ src/de/deserializer.rs              |   21 +++++---
+ tests/borrowed_str_error_variant.rs |   92 +++++++++++++++++++++++++++++++++++
+ 2 files changed, 105 insertions(+), 8 deletions(-)
+ create mode 100644 tests/borrowed_str_error_variant.rs
+
+diff --git a/src/de/deserializer.rs b/src/de/deserializer.rs
+index bbd8d68c9754771e0efb1b2653676f16547fecfb..0b357ebcf243939fae5b8cf0d198631862743a0b 100644
+--- a/src/de/deserializer.rs
++++ b/src/de/deserializer.rs
+@@ -180,6 +180,15 @@ fn remembers_seen_keys(cfg: &Cfg) -> bool {
+         || cfg.merge_keys == MergeKeyPolicy::Merge
+ }
+ 
++/// Whether `err` is the type error that Serde's `&str` visitor returns for an owned string.
++///
++/// That visitor accepts only borrowed input, and its `expecting` text is "a borrowed string".
++/// The test reads the variant and its `expected` field. It never calls `Display` on the error,
++/// which would run the snippet renderer.
++fn is_borrowed_str_mismatch(err: &Error) -> bool {
++    matches!(err, Error::SerdeInvalidType { expected, .. } if expected == "a borrowed string")
++}
++
+ /// Whether `V` is Serde's private visitor for buffering an arbitrary value as
+ /// `Content`, as used by `#[serde(untagged)]` and `#[serde(flatten)]`.
+ ///
+@@ -1267,7 +1276,7 @@ impl<'de> de::Deserializer<'de> for YamlDeserializer<'de, '_> {
+                         visitor.visit_string(self.take_string_scalar()?);
+                     return match res {
+                         Ok(v) => Ok(v),
+-                        Err(err) if err.to_string().contains("expected a borrowed string") => Err(
++                        Err(err) if is_borrowed_str_mismatch(&err) => Err(
+                             Error::cannot_borrow_transformed(TransformReason::ParserReturnedOwned)
+                                 .with_location(view.location),
+                         ),
+@@ -1313,14 +1322,10 @@ impl<'de> de::Deserializer<'de> for YamlDeserializer<'de, '_> {
+         });
+         match res {
+             Ok(v) => Ok(v),
+-            Err(err) => {
+-                let msg = err.to_string();
+-                if msg.contains("expected a borrowed string") {
+-                    return Err(Error::cannot_borrow_transformed(cannot_borrow_reason)
+-                        .with_location(location));
+-                }
+-                Err(err)
++            Err(err) if is_borrowed_str_mismatch(&err) => {
++                Err(Error::cannot_borrow_transformed(cannot_borrow_reason).with_location(location))
+             }
++            Err(err) => Err(err),
+         }
+     }
+ 
+diff --git a/tests/borrowed_str_error_variant.rs b/tests/borrowed_str_error_variant.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..43f6a96a3f7d679d5633f90623dbb03bb8ea9afd
+--- /dev/null
++++ b/tests/borrowed_str_error_variant.rs
+@@ -0,0 +1,92 @@
++#![cfg(feature = "deserialize")]
++//! Tests that `deserialize_str` maps the `&str` visitor's owned-string error to
++//! `CannotBorrowTransformedString` by matching the error variant, and leaves every
++//! other visitor error as the visitor returned it.
++
++use std::fmt;
++
++use serde::de::{self, Visitor};
++use serde::{Deserialize, Deserializer};
++use serde_saphyr::{Error, TransformReason};
++
++#[derive(Debug, Deserialize)]
++#[allow(dead_code)]
++struct BorrowedName<'a> {
++    name: &'a str,
++}
++
++#[track_caller]
++fn assert_parser_returned_owned(err: &Error, line: u64, column: u64) {
++    assert!(
++        matches!(
++            err.without_snippet(),
++            Error::CannotBorrowTransformedString {
++                reason: TransformReason::ParserReturnedOwned,
++                ..
++            }
++        ),
++        "expected CannotBorrowTransformedString, got {err:?}"
++    );
++    let location = err.location().expect("the error keeps the scalar location");
++    assert_eq!((location.line(), location.column()), (line, column));
++}
++
++#[test]
++fn escaped_scalar_into_borrowed_str_field_reports_cannot_borrow() {
++    let err = serde_saphyr::from_str::<BorrowedName<'_>>("name: \"a\\tb\"\n").unwrap_err();
++    assert_parser_returned_owned(&err, 1, 7);
++}
++
++// The location of a block scalar is its first content line, below the `>` header, as in upstream 2.1.1.
++#[test]
++fn folded_scalar_into_borrowed_str_field_reports_cannot_borrow() {
++    let err = serde_saphyr::from_str::<BorrowedName<'_>>("name: >\n  one\n  two\n").unwrap_err();
++    assert_parser_returned_owned(&err, 2, 3);
++}
++
++#[test]
++fn binary_scalar_into_borrowed_str_field_reports_cannot_borrow() {
++    let err = serde_saphyr::from_str::<BorrowedName<'_>>("name: !!binary SGVsbG8=\n").unwrap_err();
++    assert_parser_returned_owned(&err, 1, 16);
++}
++
++#[derive(Debug)]
++struct BorrowedTextOnly;
++
++impl<'de> Deserialize<'de> for BorrowedTextOnly {
++    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
++    where
++        D: Deserializer<'de>,
++    {
++        deserializer.deserialize_str(BorrowedTextOnlyVisitor)
++    }
++}
++
++struct BorrowedTextOnlyVisitor;
++
++impl<'de> Visitor<'de> for BorrowedTextOnlyVisitor {
++    type Value = BorrowedTextOnly;
++
++    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
++        formatter.write_str("borrowed text only")
++    }
++
++    fn visit_borrowed_str<E>(self, _value: &'de str) -> Result<Self::Value, E>
++    where
++        E: de::Error,
++    {
++        Ok(BorrowedTextOnly)
++    }
++}
++
++#[test]
++fn other_type_errors_from_an_owned_string_stay_as_returned() {
++    let err = serde_saphyr::from_str::<BorrowedTextOnly>("\"a\\tb\"\n").unwrap_err();
++    assert!(
++        matches!(
++            err.without_snippet(),
++            Error::SerdeInvalidType { expected, .. } if expected == "borrowed text only"
++        ),
++        "expected SerdeInvalidType, got {err:?}"
++    );
++}

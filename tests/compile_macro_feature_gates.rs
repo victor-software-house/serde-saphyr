@@ -17,6 +17,9 @@ fn write_fixture(
     fs::create_dir_all(dir.join("src")).expect("create fixture source directory");
 
     let manifest_dir = env!("CARGO_MANIFEST_DIR").replace('\\', "\\\\");
+    // The fixture keeps the dependency key `serde-saphyr`, so its code imports
+    // `serde_saphyr`, whatever name this package is published under.
+    let crate_package = env!("CARGO_PKG_NAME");
     let enabled_features = enabled_features
         .iter()
         .map(|feature| format!("\"{feature}\""))
@@ -31,7 +34,7 @@ version = "0.0.0"
 edition = "2021"
 
 [dependencies]
-serde-saphyr = {{ path = "{manifest_dir}", default-features = false, features = [{enabled_features}] }}
+serde-saphyr = {{ package = "{crate_package}", path = "{manifest_dir}", default-features = false, features = [{enabled_features}] }}
 "#
         ),
     )
