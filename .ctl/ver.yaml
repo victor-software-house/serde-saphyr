@@ -1,0 +1,14 @@
+# The fork publishes one crate. Its version and changelog change inside the
+# fork-tooling patch: run `mise run ver prepare`, which writes files only,
+# then capture them with `mise run fork patch refresh`. A Version PR would
+# add a commit outside the patch stack, so this fork opens none.
+# A bump changes the crate's own entry in both lock files, and fork CI
+# runs cargo with --locked on each.
+prepare:
+  after: [mise, run, lock]
+  stage: [Cargo.lock, fuzz/Cargo.lock]
+
+packages:
+  - name: vsh-serde-saphyr
+    path: Cargo.toml
+    changelog: FORK-CHANGELOG.md

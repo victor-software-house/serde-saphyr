@@ -1,0 +1,118 @@
+plain-alias-error-message
+
+From: Victor Araújo <victor@victor-software-house.com>
+
+Downstream-Reason: Fill the deprecated AliasError msg field from the plain message path instead of Display. Display runs the snippet renderer, so the to_string call linked annotate-snippets into every binary that deserializes YAML with aliases.
+Upstream-Status: not-submitted
+Drop-When: Upstream serde-saphyr stops calling Display when it wraps an error in AliasError.
+---
+ src/de/error.rs                    |   23 +++++++++++++++++++
+ src/de/events.rs                   |    2 +-
+ tests/alias_error_plain_message.rs |   44 ++++++++++++++++++++++++++++++++++++
+ 3 files changed, 68 insertions(+), 1 deletion(-)
+ create mode 100644 tests/alias_error_plain_message.rs
+
+diff --git a/src/de/error.rs b/src/de/error.rs
+index a799506bb3764246269526e220d59a51c26686b6..270505ab5cb066b877ff684c94d4d05860636db8 100644
+--- a/src/de/error.rs
++++ b/src/de/error.rs
+@@ -1483,6 +1483,12 @@ impl Error {
+         }
+     }
+ 
++    /// The message `Display` writes for an error without a snippet wrapper, built without the
++    /// snippet renderer.
++    pub(crate) fn plain_message(&self) -> String {
++        PlainDisplay(self).to_string()
++    }
++
+     /// Whether a persistent interpolation-budget breach ended this operation,
+     /// including errors wrapped with alias locations or source snippets.
+     pub(crate) fn is_property_interpolation_budget_breach(&self) -> bool {
+@@ -2144,6 +2150,23 @@ fn writeln_anchor_intro(
+     }
+ }
+ 
++/// Writes an error through the plain path alone, with the default formatter and no line offset.
++///
++/// For an error without a snippet wrapper this is the text `Display` writes, but the snippet
++/// renderer is never called, so a caller that needs only the message does not link it.
++struct PlainDisplay<'a>(&'a Error);
++
++impl fmt::Display for PlainDisplay<'_> {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        fmt_error_plain_with_formatter(
++            f,
++            self.0,
++            &crate::message_formatters::DefaultMessageFormatter,
++            0,
++        )
++    }
++}
++
+ struct RenderDisplay<'a> {
+     err: &'a Error,
+     options: RenderOptions<'a>,
+diff --git a/src/de/events.rs b/src/de/events.rs
+index 94b3ad27f05860af3f7b444e9bbe5b6dc1153168..e1b9246d87520d5bff8a8394cacfff9521bad20d 100644
+--- a/src/de/events.rs
++++ b/src/de/events.rs
+@@ -131,7 +131,7 @@ pub(super) fn attach_alias_locations_if_missing(
+             return err;
+         }
+         Error::AliasError {
+-            msg: err.to_string(),
++            msg: err.plain_message(),
+             error: Box::new(err),
+             locations: Locations {
+                 reference_location,
+diff --git a/tests/alias_error_plain_message.rs b/tests/alias_error_plain_message.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..0e936b0f1684c30e1994b31611a914e35821d3f4
+--- /dev/null
++++ b/tests/alias_error_plain_message.rs
+@@ -0,0 +1,44 @@
++#![cfg(feature = "deserialize")]
++//! Tests that the deprecated `msg` field of `Error::AliasError` holds the plain message of the
++//! error it wraps, the text that error's `Display` writes, for an alias replayed inside the
++//! replay of another alias.
++
++use serde::Deserialize;
++use serde_saphyr::Error;
++
++#[derive(Debug, Deserialize)]
++#[allow(dead_code)]
++struct Port {
++    port: u16,
++}
++
++#[derive(Debug, Deserialize)]
++#[allow(dead_code)]
++struct Copy {
++    copy: Port,
++}
++
++const NESTED_ALIASES: &str = "value: &v eighty\nbase: &b\n  port: *v\ncopy: *b\n";
++
++#[test]
++#[allow(deprecated)] // `msg` is the field under test.
++fn alias_inside_an_alias_keeps_the_plain_message_of_the_failing_value() {
++    for outer in [
++        serde_saphyr::from_str::<Copy>(NESTED_ALIASES).unwrap_err(),
++        serde_saphyr::from_reader::<_, Copy>(NESTED_ALIASES.as_bytes()).unwrap_err(),
++    ] {
++        let Error::AliasError { msg, error, .. } = outer.without_snippet() else {
++            panic!("expected an alias error, got {outer:?}");
++        };
++        assert!(matches!(
++            error.as_ref(),
++            Error::InvalidScalar { ty: "u16", .. }
++        ));
++        assert_eq!(msg, "invalid u16 at line 1, column 11");
++        assert_eq!(*msg, error.to_string());
++        assert_eq!(
++            outer.without_snippet().to_string(),
++            "invalid u16 at line 1, column 11 (defined at line 3, column 3) (used at line 4, column 7)"
++        );
++    }
++}
