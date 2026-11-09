@@ -1,0 +1,90 @@
+%YAML 1.2
+---
+schema: 1
+downstream:
+  remote: origin
+  branch: downstream
+  recovery_tag_prefix: forkctl/recovery
+  publish: append
+upstream:
+  remote: upstream
+  url: https://github.com/bourumir-wyngs/serde-saphyr.git
+  fetch_ref: refs/heads/master
+base:
+  target:
+    kind: tag
+    selector: refs/tags/2.1.1
+    commit: 07bfc26a3733c29deb735b88cd18f87074bdf267
+  canonical: 07bfc26a3733c29deb735b88cd18f87074bdf267
+  stack: 07bfc26a3733c29deb735b88cd18f87074bdf267
+documents:
+  ledger: PATCHES.md
+  exports: patches/downstream
+bookkeeping_patch: fork-tooling
+patches:
+  - name: match-borrow-error-variant
+    kind: source
+    purpose: >-
+      Recognize the error that the &str visitor returns for an owned string by its
+      variant and expected text instead of its Display text. Display runs the snippet
+      renderer, so the text test linked annotate-snippets into every binary that derives a
+      struct with string keys.
+    upstream_status: not-submitted
+    drop_when: Upstream serde-saphyr deserialize_str stops calling Display on a visitor error.
+    scope:
+      - src/de/deserializer.rs
+      - tests/borrowed_str_error_variant.rs
+  - name: plain-alias-error-message
+    kind: source
+    purpose: >-
+      Fill the deprecated AliasError msg field from the plain message path instead of
+      Display. Display runs the snippet renderer, so the to_string call linked
+      annotate-snippets into every binary that deserializes YAML with aliases.
+    upstream_status: not-submitted
+    drop_when: >-
+      Upstream serde-saphyr stops calling Display when it wraps an error in
+      AliasError.
+    scope:
+      - src/de/events.rs
+      - src/de/error.rs
+      - tests/alias_error_plain_message.rs
+  - name: tagged-plain-value
+    kind: source
+    purpose: "Tagged<T> captures a node's tag and then gives T the node without it, so an untagged enum or any Content-buffered type reads the plain value. Without it, Serde's Content buffer sees the tag again and reads the node as a one-key map {tag: value}."
+    upstream_status: not-submitted
+    drop_when: >-
+      Upstream serde-saphyr gives the inner value of Tagged<T> the node without the
+      synthetic tag map.
+    scope:
+      - src/de/**
+      - tests/**
+  - name: fork-tooling
+    kind: tooling
+    purpose: >-
+      Own fork policy, generated evidence, CI, and the crates.io release as
+      vsh-serde-saphyr with the library name serde_saphyr.
+    upstream_status: "inappropriate: downstream-only fork maintenance"
+    drop_when: The downstream fork is retired.
+    scope:
+      - patches/fork.yaml
+      - PATCHES.md
+      - patches/downstream/**
+      - mise.toml
+      - mise.*.toml
+      - mise*.lock
+      - Cargo.toml
+      - Cargo.lock
+      - fuzz/Cargo.toml
+      - fuzz/Cargo.lock
+      - .ctl/**
+      - .changeset/**
+      - FORK-CHANGELOG.md
+      - .github/workflows/fork-*.yml
+      - tests/compile_macro_feature_gates.rs
+      - LICENSE-MIT
+      - NOTICE
+disabled_patches: []
+history: []
+contracts:
+  allow_base: []
+  required_text: []

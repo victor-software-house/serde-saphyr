@@ -1,0 +1,172 @@
+tagged-plain-value
+
+From: Victor Araújo <victor@victor-software-house.com>
+
+Downstream-Reason: Tagged<T> captures a node's tag and then gives T the node without it, so an untagged enum or any Content-buffered type reads the plain value. Without it, Serde's Content buffer sees the tag again and reads the node as a one-key map {tag: value}.
+Upstream-Status: not-submitted
+Drop-When: Upstream serde-saphyr gives the inner value of Tagged<T> the node without the synthetic tag map.
+---
+ src/de/deserializer.rs |   10 +++++-
+ src/de/tagged_deser.rs |   81 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 90 insertions(+), 1 deletion(-)
+
+diff --git a/src/de/deserializer.rs b/src/de/deserializer.rs
+index 0b357ebcf243939fae5b8cf0d198631862743a0b..bfebd8518dd06c962f7e68d0aba61f7a1d9bdf8e 100644
+--- a/src/de/deserializer.rs
++++ b/src/de/deserializer.rs
+@@ -258,6 +258,9 @@ pub struct YamlDeserializer<'de, 'e> {
+     struct_mode: bool,
+     /// True when the recorded key node was exactly an empty mapping (`MapStart` followed by `MapEnd`).
+     key_empty_map_node: bool,
++    /// True when `Tagged<T>` took this node's tag already, so the node reads as
++    /// its plain value instead of a synthetic `{tag: value}` map.
++    pub(super) tag_taken: bool,
+     /// Comments that the parent mapping associated with this value.
+     pub(super) pending_comments: Vec<Cow<'de, str>>,
+     /// Same-line comments after the parent container separator (`key:` or `-`).
+@@ -487,6 +490,7 @@ impl<'de, 'e> YamlDeserializer<'de, 'e> {
+             in_key: false,
+             struct_mode: false,
+             key_empty_map_node: false,
++            tag_taken: false,
+             pending_comments: Vec::new(),
+             pending_value_separator_comments: Vec::new(),
+             pending_value_comments: Vec::new(),
+@@ -557,6 +561,7 @@ impl<'de, 'e> YamlDeserializer<'de, 'e> {
+             in_key: false,
+             struct_mode: false,
+             key_empty_map_node: false,
++            tag_taken: false,
+             pending_comments: Vec::new(),
+             pending_value_separator_comments: Vec::new(),
+             pending_value_comments: Vec::new(),
+@@ -927,7 +932,9 @@ impl<'de> de::Deserializer<'de> for YamlDeserializer<'de, '_> {
+         // Only Serde's generic Content buffer needs tagged nodes represented as
+         // synthetic maps. General untyped visitors discard YAML tags, while other
+         // private Serde visitors may attach their own meaning to the original map.
+-        if is_serde_content_buffer::<V>()
++        // A tag that `Tagged<T>` took already is not read again.
++        if !self.tag_taken
++            && is_serde_content_buffer::<V>()
+             && let Some(events) = capture_simple_tagged_node_as_map_events(self.ev)?
+         {
+             let mut replay = ReplayEvents::new(
+@@ -2104,6 +2111,7 @@ impl<'de> de::Deserializer<'de> for YamlDeserializer<'de, '_> {
+                     in_key: true,
+                     struct_mode: false,
+                     key_empty_map_node: kemn,
++                    tag_taken: false,
+                     pending_comments: Vec::new(),
+                     pending_value_separator_comments: Vec::new(),
+                     pending_value_comments: Vec::new(),
+diff --git a/src/de/tagged_deser.rs b/src/de/tagged_deser.rs
+index efb46a7f710eccf0ca2d78b4ac7e922ace36d92e..c3785e90af4610dee9e88b29ad7800a9d2327140 100644
+--- a/src/de/tagged_deser.rs
++++ b/src/de/tagged_deser.rs
+@@ -59,6 +59,7 @@ impl<'de> de::SeqAccess<'de> for TaggedSeqAccess<'de, '_> {
+                     de.pending_value_separator_comments =
+                         std::mem::take(&mut self.de.pending_value_separator_comments);
+                     de.pending_value_comments = std::mem::take(&mut self.de.pending_value_comments);
++                    de.tag_taken = true;
+                     seed.deserialize(de)?
+                 } else {
+                     let mut de = Deserializer::new(&mut *self.de.ev, self.de.cfg);
+@@ -66,6 +67,7 @@ impl<'de> de::SeqAccess<'de> for TaggedSeqAccess<'de, '_> {
+                     de.pending_value_separator_comments =
+                         std::mem::take(&mut self.de.pending_value_separator_comments);
+                     de.pending_value_comments = std::mem::take(&mut self.de.pending_value_comments);
++                    de.tag_taken = true;
+                     seed.deserialize(de)?
+                 };
+ 
+@@ -76,6 +78,7 @@ impl<'de> de::SeqAccess<'de> for TaggedSeqAccess<'de, '_> {
+                     de.pending_value_separator_comments =
+                         std::mem::take(&mut self.de.pending_value_separator_comments);
+                     de.pending_value_comments = std::mem::take(&mut self.de.pending_value_comments);
++                    de.tag_taken = true;
+                     seed.deserialize(de)?
+                 };
+ 
+@@ -261,4 +264,82 @@ mod tests {
+             )
+         );
+     }
++
++    #[derive(Debug, PartialEq, serde::Deserialize)]
++    #[serde(untagged)]
++    enum Setting {
++        List(Vec<String>),
++        Word(String),
++        Number(u64),
++        Map(std::collections::BTreeMap<String, u64>),
++    }
++
++    #[test]
++    fn gives_an_untagged_enum_the_plain_value() {
++        let list: Tagged<Setting> = from_str("!override [Acme, Beta]").unwrap();
++        assert_eq!(
++            list,
++            Tagged(
++                Setting::List(vec!["Acme".into(), "Beta".into()]),
++                Some("!override".into())
++            )
++        );
++
++        let word: Tagged<Setting> = from_str("!override error").unwrap();
++        assert_eq!(
++            word,
++            Tagged(Setting::Word("error".into()), Some("!override".into()))
++        );
++
++        let number: Tagged<Setting> = from_str("!override 0").unwrap();
++        assert_eq!(number, Tagged(Setting::Number(0), Some("!override".into())));
++
++        let map: Tagged<Setting> = from_str("!override {max: 2}").unwrap();
++        assert_eq!(
++            map,
++            Tagged(
++                Setting::Map([("max".into(), 2)].into()),
++                Some("!override".into())
++            )
++        );
++
++        let untagged: Tagged<Setting> = from_str("[Acme]").unwrap();
++        assert_eq!(untagged, Tagged(Setting::List(vec!["Acme".into()]), None));
++    }
++
++    #[test]
++    fn gives_each_value_of_a_map_its_own_tag() {
++        let settings: std::collections::BTreeMap<String, Tagged<Setting>> =
++            from_str("styles: !override [Acme]\nlevel: warning\n").unwrap();
++        assert_eq!(
++            settings.get("styles"),
++            Some(&Tagged(
++                Setting::List(vec!["Acme".into()]),
++                Some("!override".into())
++            ))
++        );
++        assert_eq!(
++            settings.get("level"),
++            Some(&Tagged(Setting::Word("warning".into()), None))
++        );
++    }
++
++    #[test]
++    fn leaves_a_tag_below_the_tagged_node_to_the_inner_value() {
++        // Only the node that Tagged reads gives up its tag. A tag on a child
++        // still reaches an untagged enum as the {tag: value} map, as before.
++        #[derive(Debug, PartialEq, serde::Deserialize)]
++        #[serde(untagged)]
++        enum Inner {
++            Number(u64),
++            Map(std::collections::BTreeMap<String, u64>),
++        }
++        let nested: Tagged<std::collections::BTreeMap<String, Inner>> =
++            from_str("!outer {max: !inner 2}").unwrap();
++        assert_eq!(nested.1, Some("!outer".into()));
++        assert_eq!(
++            nested.0.get("max"),
++            Some(&Inner::Map([("inner".into(), 2)].into()))
++        );
++    }
+ }
