@@ -1,0 +1,38 @@
+min_version = "2026.10.9"
+
+[settings]
+experimental = true
+lockfile = true
+
+[env]
+FORKCTL_MANIFEST = "patches/fork.yaml"
+
+[tools]
+rust = { version = "1.99.0", profile = "minimal", components = "clippy,rustfmt" }
+
+[task_config]
+includes = [
+  "git::https://github.com/victor-software-house/forkctl.git//tasks/fork?ref=v0.0.48",
+  "git::https://github.com/victor-software-house/verctl.git//tasks/ver?ref=v0.7.2",
+]
+
+# The checks the fork CI runs: upstream's clippy and build jobs, a format
+# check, and a package build of the renamed crate.
+[tasks.verify]
+description = "Format, lint, test every upstream feature set, and package the crate"
+run = [
+  "cargo fmt --all -- --check",
+  "cargo clippy --locked --all-targets --all-features -- -D warnings",
+  "cargo clippy --locked --manifest-path fuzz/Cargo.toml --all-targets --all-features -- -D warnings",
+  "cargo test --locked --doc --all-features",
+  "cargo test --locked --all-features --examples",
+  "cargo test --locked",
+  "cargo test --locked --manifest-path fuzz/Cargo.toml --bin serialize",
+  "cargo test --locked --features miette",
+  "cargo test --locked --features garde,validator,miette,figment,robotics",
+  "cargo test --locked --no-default-features --features serialize,deserialize",
+  "cargo test --locked --no-default-features --features deserialize,granit-parser/comments --test without_comments",
+  "cargo test --locked --no-default-features --features include,granit-parser/comments --test without_comments",
+  "cargo test --locked --features huge_documents",
+  "cargo package --locked",
+]
