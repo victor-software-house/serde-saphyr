@@ -59,6 +59,7 @@ impl<'de> de::SeqAccess<'de> for TaggedSeqAccess<'de, '_> {
                     de.pending_value_separator_comments =
                         std::mem::take(&mut self.de.pending_value_separator_comments);
                     de.pending_value_comments = std::mem::take(&mut self.de.pending_value_comments);
+                    de.tag_taken = true;
                     seed.deserialize(de)?
                 } else {
                     let mut de = Deserializer::new(&mut *self.de.ev, self.de.cfg);
@@ -66,6 +67,7 @@ impl<'de> de::SeqAccess<'de> for TaggedSeqAccess<'de, '_> {
                     de.pending_value_separator_comments =
                         std::mem::take(&mut self.de.pending_value_separator_comments);
                     de.pending_value_comments = std::mem::take(&mut self.de.pending_value_comments);
+                    de.tag_taken = true;
                     seed.deserialize(de)?
                 };
 
@@ -76,6 +78,7 @@ impl<'de> de::SeqAccess<'de> for TaggedSeqAccess<'de, '_> {
                     de.pending_value_separator_comments =
                         std::mem::take(&mut self.de.pending_value_separator_comments);
                     de.pending_value_comments = std::mem::take(&mut self.de.pending_value_comments);
+                    de.tag_taken = true;
                     seed.deserialize(de)?
                 };
 
@@ -259,6 +262,84 @@ mod tests {
                 Tagged("value".into(), Some("!widget".into())),
                 "note".into()
             )
+        );
+    }
+
+    #[derive(Debug, PartialEq, serde::Deserialize)]
+    #[serde(untagged)]
+    enum Setting {
+        List(Vec<String>),
+        Word(String),
+        Number(u64),
+        Map(std::collections::BTreeMap<String, u64>),
+    }
+
+    #[test]
+    fn gives_an_untagged_enum_the_plain_value() {
+        let list: Tagged<Setting> = from_str("!override [Acme, Beta]").unwrap();
+        assert_eq!(
+            list,
+            Tagged(
+                Setting::List(vec!["Acme".into(), "Beta".into()]),
+                Some("!override".into())
+            )
+        );
+
+        let word: Tagged<Setting> = from_str("!override error").unwrap();
+        assert_eq!(
+            word,
+            Tagged(Setting::Word("error".into()), Some("!override".into()))
+        );
+
+        let number: Tagged<Setting> = from_str("!override 0").unwrap();
+        assert_eq!(number, Tagged(Setting::Number(0), Some("!override".into())));
+
+        let map: Tagged<Setting> = from_str("!override {max: 2}").unwrap();
+        assert_eq!(
+            map,
+            Tagged(
+                Setting::Map([("max".into(), 2)].into()),
+                Some("!override".into())
+            )
+        );
+
+        let untagged: Tagged<Setting> = from_str("[Acme]").unwrap();
+        assert_eq!(untagged, Tagged(Setting::List(vec!["Acme".into()]), None));
+    }
+
+    #[test]
+    fn gives_each_value_of_a_map_its_own_tag() {
+        let settings: std::collections::BTreeMap<String, Tagged<Setting>> =
+            from_str("styles: !override [Acme]\nlevel: warning\n").unwrap();
+        assert_eq!(
+            settings.get("styles"),
+            Some(&Tagged(
+                Setting::List(vec!["Acme".into()]),
+                Some("!override".into())
+            ))
+        );
+        assert_eq!(
+            settings.get("level"),
+            Some(&Tagged(Setting::Word("warning".into()), None))
+        );
+    }
+
+    #[test]
+    fn leaves_a_tag_below_the_tagged_node_to_the_inner_value() {
+        // Only the node that Tagged reads gives up its tag. A tag on a child
+        // still reaches an untagged enum as the {tag: value} map, as before.
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        #[serde(untagged)]
+        enum Inner {
+            Number(u64),
+            Map(std::collections::BTreeMap<String, u64>),
+        }
+        let nested: Tagged<std::collections::BTreeMap<String, Inner>> =
+            from_str("!outer {max: !inner 2}").unwrap();
+        assert_eq!(nested.1, Some("!outer".into()));
+        assert_eq!(
+            nested.0.get("max"),
+            Some(&Inner::Map([("inner".into(), 2)].into()))
         );
     }
 }

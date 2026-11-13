@@ -258,6 +258,9 @@ pub struct YamlDeserializer<'de, 'e> {
     struct_mode: bool,
     /// True when the recorded key node was exactly an empty mapping (`MapStart` followed by `MapEnd`).
     key_empty_map_node: bool,
+    /// True when `Tagged<T>` took this node's tag already, so the node reads as
+    /// its plain value instead of a synthetic `{tag: value}` map.
+    pub(super) tag_taken: bool,
     /// Comments that the parent mapping associated with this value.
     pub(super) pending_comments: Vec<Cow<'de, str>>,
     /// Same-line comments after the parent container separator (`key:` or `-`).
@@ -487,6 +490,7 @@ impl<'de, 'e> YamlDeserializer<'de, 'e> {
             in_key: false,
             struct_mode: false,
             key_empty_map_node: false,
+            tag_taken: false,
             pending_comments: Vec::new(),
             pending_value_separator_comments: Vec::new(),
             pending_value_comments: Vec::new(),
@@ -557,6 +561,7 @@ impl<'de, 'e> YamlDeserializer<'de, 'e> {
             in_key: false,
             struct_mode: false,
             key_empty_map_node: false,
+            tag_taken: false,
             pending_comments: Vec::new(),
             pending_value_separator_comments: Vec::new(),
             pending_value_comments: Vec::new(),
@@ -927,7 +932,9 @@ impl<'de> de::Deserializer<'de> for YamlDeserializer<'de, '_> {
         // Only Serde's generic Content buffer needs tagged nodes represented as
         // synthetic maps. General untyped visitors discard YAML tags, while other
         // private Serde visitors may attach their own meaning to the original map.
-        if is_serde_content_buffer::<V>()
+        // A tag that `Tagged<T>` took already is not read again.
+        if !self.tag_taken
+            && is_serde_content_buffer::<V>()
             && let Some(events) = capture_simple_tagged_node_as_map_events(self.ev)?
         {
             let mut replay = ReplayEvents::new(
@@ -2104,6 +2111,7 @@ impl<'de> de::Deserializer<'de> for YamlDeserializer<'de, '_> {
                     in_key: true,
                     struct_mode: false,
                     key_empty_map_node: kemn,
+                    tag_taken: false,
                     pending_comments: Vec::new(),
                     pending_value_separator_comments: Vec::new(),
                     pending_value_comments: Vec::new(),
