@@ -62,6 +62,8 @@ pub mod robotics;
 #[cfg(all(feature = "deserialize", feature = "include_fs"))]
 pub(crate) mod safe_resolver;
 #[cfg(feature = "deserialize")]
+pub mod scalars;
+#[cfg(feature = "deserialize")]
 pub(crate) mod snippet;
 #[cfg(feature = "deserialize")]
 pub(crate) mod tags;

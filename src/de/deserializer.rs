@@ -21,7 +21,7 @@ use super::key_nodes::{
 };
 #[cfg(feature = "properties")]
 use super::options::PropertySyntax;
-use super::options::{DuplicateKeyPolicy, MergeKeyPolicy, NonFiniteFloatPolicy};
+use super::options::{DuplicateKeyPolicy, MergeKeyPolicy};
 #[cfg(any(feature = "garde", feature = "validator"))]
 use super::path_map::PathRecorder;
 #[cfg(feature = "properties")]
@@ -29,6 +29,7 @@ use super::properties::{interpolate_compose_style_with_limits, is_sole_unset_ref
 use super::properties_redaction::{
     ScalarRedactionCtx, ScalarRedactionGuard, with_interp_redaction_scope,
 };
+use super::scalars::{self, Inferred, Plan};
 use super::spanned_deser;
 use super::tagged_deser;
 use super::tags::SfTag;
@@ -40,11 +41,7 @@ use crate::de_error::budget_error;
 use crate::location::Location;
 #[cfg(any(feature = "garde", feature = "validator"))]
 use crate::location::Locations;
-use crate::parse_scalars::{
-    leading_zero_decimal, maybe_not_string, parse_int_signed, parse_int_unsigned,
-    parse_yaml11_bool, parse_yaml12_bool, parse_yaml12_float, scalar_is_null, scalar_is_nullish,
-    try_parse_float_incl_overflow, yaml_trim,
-};
+use crate::parse_scalars::{maybe_not_string, scalar_is_null, scalar_is_nullish};
 
 struct TupleLenExpected {
     len: usize,
@@ -450,26 +447,7 @@ impl<'de, 'e> YamlDeserializer<'de, 'e> {
         ty: &'static str,
         location: Location,
     ) -> Result<(), Error> {
-        let compatible = tag == expected
-            || match tag {
-                SfTag::None
-                | SfTag::Other
-                | SfTag::Include
-                | SfTag::Merge
-                | SfTag::Value
-                | SfTag::NonSpecific => true,
-                tag if tag.is_robotics() => {
-                    expected == SfTag::Float
-                        && cfg!(feature = "robotics")
-                        && self.cfg.angle_conversions
-                }
-                _ => false,
-            };
-        if compatible {
-            Ok(())
-        } else {
-            Err(Error::InvalidScalar { ty, location })
-        }
+        scalars::validate_tag(&self.cfg, tag, expected, ty, location)
     }
 
     /// Construct a new streaming deserializer over an `Events` source.
@@ -619,56 +597,7 @@ impl<'de, 'e> YamlDeserializer<'de, 'e> {
     /// is not valid UTF-8.
     fn take_string_scalar(&mut self) -> Result<String, Error> {
         let (value, tag, location) = self.take_scalar_event()?;
-
-        // Special-case binary: decode base64 and require valid UTF-8.
-        if tag == SfTag::Binary && !self.cfg.ignore_binary_tag_for_string {
-            let data = decode_base64_yaml(&value).map_err(|err| err.with_location(location))?;
-            let text = String::from_utf8(data).map_err(|_| Error::BinaryNotUtf8 { location })?;
-            return Ok(text);
-        }
-
-        // For non-binary, ensure the tag allows string deserialization.
-        if !(tag.can_parse_into_string()
-            || self.cfg.ignore_binary_tag_for_string && tag == SfTag::Binary)
-        {
-            return Err(Error::TaggedScalarCannotDeserializeIntoString { location });
-        }
-
-        Ok(value)
-    }
-
-    /// Deliver a float to a typeless visitor, applying the configured non-finite policy.
-    fn visit_typeless_float<V: Visitor<'de>>(
-        &self,
-        value: f64,
-        raw: String,
-        location: Location,
-        visitor: V,
-    ) -> Result<V::Value, Error> {
-        if value.is_finite() {
-            return visitor.visit_f64(value);
-        }
-        match self.cfg.non_finite_float_policy {
-            NonFiniteFloatPolicy::PassThrough => visitor.visit_f64(value),
-            // Cfg resolves the compatibility default; an unconfigured policy otherwise
-            // has the same behavior as Reject.
-            NonFiniteFloatPolicy::Default | NonFiniteFloatPolicy::Reject => {
-                Err(Error::NonFiniteFloat {
-                    value: raw,
-                    location,
-                })
-            }
-            NonFiniteFloatPolicy::AsString => {
-                let canonical = if value.is_nan() {
-                    ".nan"
-                } else if value.is_sign_negative() {
-                    "-.inf"
-                } else {
-                    ".inf"
-                };
-                visitor.visit_string(canonical.to_owned())
-            }
-        }
+        scalars::string(&self.cfg, Cow::Owned(value), tag, location).map(Cow::into_owned)
     }
 
     /// Expect a sequence start and consume it, or error otherwise.
@@ -945,130 +874,35 @@ impl<'de> de::Deserializer<'de> for YamlDeserializer<'de, '_> {
             return YamlDeserializer::new(&mut replay, self.cfg).deserialize_map(visitor);
         }
 
-        if let Some((value, tag, style, location)) = self.peek_effective_scalar()? {
-            // Explicit scalar types take precedence over implicit null and string inference,
-            // including for quoted and block scalars buffered by Serde's flatten support.
-            match tag {
-                SfTag::Null => {
-                    let _ = self.take_scalar_event()?;
-                    return visitor.visit_unit();
-                }
-                SfTag::Bool => return self.deserialize_bool(visitor),
-                SfTag::Int if yaml_trim(&value).starts_with('-') => {
-                    return self.deserialize_i64(visitor);
-                }
-                SfTag::Int => return self.deserialize_u64(visitor),
-                SfTag::Float | SfTag::Time | SfTag::Degrees | SfTag::Radians => {
-                    self.validate_scalar_tag(tag, SfTag::Float, "floating point", location)?;
-                    let view = self.take_scalar_view()?;
-                    let value = try_parse_float_incl_overflow(
-                        &view.effective,
-                        view.location,
-                        view.tag,
-                        self.cfg.angle_conversions,
-                    )
-                    .ok_or(Error::InvalidScalar {
-                        ty: "floating point",
-                        location: view.location,
-                    })?;
-                    return self.visit_typeless_float(
-                        value,
-                        view.raw.into_owned(),
-                        view.location,
-                        visitor,
-                    );
-                }
-                _ => {}
-            }
-            let is_plain = matches!(style, ScalarStyle::Plain);
-            // String tags (!!str and !) preserve null-like text (null, ~, empty).
-            if scalar_is_null(&tag, &value, &style) {
+        if let Some(first) = self.peek_scalar_view()? {
+            if scalars::precheck(
+                &self.cfg,
+                &first.effective,
+                first.tag,
+                first.style,
+                first.location,
+            )? == Plan::Null
+            {
                 let _ = self.ev.next()?; // consume
                 return visitor.visit_unit();
             }
-            if !is_plain
-                || !tag.can_parse_into_string()
-                || tag == SfTag::Binary
-                || tag.forces_string()
-            {
-                // For string-ish scalars, rely on the parser's own zero-copy capability:
-                // if the scalar is returned as `Cow::Borrowed`, we can pass it through.
-                // Otherwise we fall back to owning.
-                if tag == SfTag::Binary && !self.cfg.ignore_binary_tag_for_string {
-                    return visitor.visit_string(self.take_string_scalar()?);
-                }
-                if !(tag.can_parse_into_string()
-                    || self.cfg.ignore_binary_tag_for_string && tag == SfTag::Binary)
-                {
-                    return Err(Error::TaggedScalarCannotDeserializeIntoString { location });
-                }
-
-                let (cow, _tag2, _location) = self.take_scalar_cow_event()?;
-                return match cow {
-                    Cow::Borrowed(b) => visitor.visit_borrowed_str(b),
-                    Cow::Owned(s) => visitor.visit_string(s),
-                };
-            }
-
-            // Consume the scalar and attempt typed parses in order: bool -> int -> float.
-            // Parse the effective value, but keep the raw source text for diagnostics.
             let view = self.take_scalar_view()?;
-            let effective = view.effective;
-            let location = view.location;
-
-            // Try booleans.
-            if self.cfg.strict_booleans {
-                if let Some(b) = parse_yaml12_bool(&effective) {
-                    return visitor.visit_bool(b);
-                }
-            } else if let Some(b) = parse_yaml11_bool(&effective) {
-                return visitor.visit_bool(b);
-            }
-
-            let t = yaml_trim(&effective);
-            // Preserve selected spellings before either numeric parser can consume
-            // them. Explicit numeric tags have already dispatched above.
-            if (self.cfg.leading_zero_numbers_as_strings && leading_zero_decimal(t))
-                || (self.cfg.underscored_numbers_as_strings && t.contains('_'))
-            {
-                return match effective {
-                    Cow::Borrowed(b) => visitor.visit_borrowed_str(b),
-                    Cow::Owned(s) => visitor.visit_string(s),
-                };
-            }
-
-            // Try integers: signed if leading '-', else unsigned, using 64-bit visitors.
-            if t.starts_with('-') {
-                if (!leading_zero_decimal(t) || self.cfg.legacy_octal_numbers)
-                    && let Ok(v) =
-                        parse_int_signed::<i64>(t, "i64", location, self.cfg.legacy_octal_numbers)
-                {
-                    return visitor.visit_i64(v);
-                }
-            } else {
-                if let Ok(v) =
-                    parse_int_unsigned::<u64>(t, "u64", location, self.cfg.legacy_octal_numbers)
-                {
-                    return visitor.visit_u64(v);
-                }
-            }
-
-            // Try float per YAML 1.2 forms, treating an f64-overflowing literal (e.g.
-            // `1e999`) as non-finite too, so both shapes are handled consistently below.
-            if let Some(v) = try_parse_float_incl_overflow(
-                &effective,
-                location,
+            let inferred = scalars::infer(
+                &self.cfg,
+                view.effective,
+                &view.raw,
                 view.tag,
-                self.cfg.angle_conversions,
-            ) {
-                return self.visit_typeless_float(v, view.raw.into_owned(), location, visitor);
-            }
-
-            // Fallback: treat as string as-is, preserving zero-copy borrowing when the
-            // parser handed us a slice of the original input.
-            return match effective {
-                Cow::Borrowed(b) => visitor.visit_borrowed_str(b),
-                Cow::Owned(s) => visitor.visit_string(s),
+                view.style,
+                view.location,
+            )?;
+            return match inferred {
+                Inferred::Null => visitor.visit_unit(),
+                Inferred::Bool(value) => visitor.visit_bool(value),
+                Inferred::Signed(value) => visitor.visit_i64(value),
+                Inferred::Unsigned(value) => visitor.visit_u64(value),
+                Inferred::Float(value) => visitor.visit_f64(value),
+                Inferred::String(Cow::Borrowed(value)) => visitor.visit_borrowed_str(value),
+                Inferred::String(Cow::Owned(value)) => visitor.visit_string(value),
             };
         }
 
@@ -1106,108 +940,82 @@ impl<'de> de::Deserializer<'de> for YamlDeserializer<'de, '_> {
     /// Flow: scalar text → `Visitor::visit_bool`.
     fn deserialize_bool<V: Visitor<'de>>(mut self, visitor: V) -> Result<V::Value, Self::Error> {
         let (s, tag, location) = self.take_scalar_cow_event()?;
-        self.validate_scalar_tag(tag, SfTag::Bool, "boolean", location)?;
-        let s = s.as_ref();
-        let b: bool = if self.cfg.strict_booleans {
-            parse_yaml12_bool(s).ok_or(Error::InvalidBooleanStrict { location })?
-        } else {
-            parse_yaml11_bool(s).ok_or(Error::InvalidScalar {
-                ty: "boolean",
-                location,
-            })?
-        };
+        let b = scalars::boolean(&self.cfg, s.as_ref(), tag, location)?;
         visitor.visit_bool(b)
     }
 
     /// Parse a signed 8-bit integer.
     fn deserialize_i8<V: Visitor<'de>>(mut self, visitor: V) -> Result<V::Value, Self::Error> {
         let (s, tag, location) = self.take_scalar_cow_event()?;
-        self.validate_scalar_tag(tag, SfTag::Int, "i8", location)?;
-        let v: i8 = parse_int_signed(s.as_ref(), "i8", location, self.cfg.legacy_octal_numbers)?;
+        let v: i8 = scalars::signed(&self.cfg, s.as_ref(), tag, "i8", location)?;
         visitor.visit_i8(v)
     }
     /// Parse a signed 16-bit integer.
     fn deserialize_i16<V: Visitor<'de>>(mut self, visitor: V) -> Result<V::Value, Self::Error> {
         let (s, tag, location) = self.take_scalar_cow_event()?;
-        self.validate_scalar_tag(tag, SfTag::Int, "i16", location)?;
-        let v: i16 = parse_int_signed(s.as_ref(), "i16", location, self.cfg.legacy_octal_numbers)?;
+        let v: i16 = scalars::signed(&self.cfg, s.as_ref(), tag, "i16", location)?;
         visitor.visit_i16(v)
     }
     /// Parse a signed 32-bit integer.
     fn deserialize_i32<V: Visitor<'de>>(mut self, visitor: V) -> Result<V::Value, Self::Error> {
         let (s, tag, location) = self.take_scalar_cow_event()?;
-        self.validate_scalar_tag(tag, SfTag::Int, "i32", location)?;
-        let v: i32 = parse_int_signed(s.as_ref(), "i32", location, self.cfg.legacy_octal_numbers)?;
+        let v: i32 = scalars::signed(&self.cfg, s.as_ref(), tag, "i32", location)?;
         visitor.visit_i32(v)
     }
     /// Parse a signed 64-bit integer.
     fn deserialize_i64<V: Visitor<'de>>(mut self, visitor: V) -> Result<V::Value, Self::Error> {
         let (s, tag, location) = self.take_scalar_cow_event()?;
-        self.validate_scalar_tag(tag, SfTag::Int, "i64", location)?;
-        let v: i64 = parse_int_signed(s.as_ref(), "i64", location, self.cfg.legacy_octal_numbers)?;
+        let v: i64 = scalars::signed(&self.cfg, s.as_ref(), tag, "i64", location)?;
         visitor.visit_i64(v)
     }
     /// Parse a signed 128-bit integer.
     fn deserialize_i128<V: Visitor<'de>>(mut self, visitor: V) -> Result<V::Value, Self::Error> {
         let (s, tag, location) = self.take_scalar_cow_event()?;
-        self.validate_scalar_tag(tag, SfTag::Int, "i128", location)?;
-        let v: i128 =
-            parse_int_signed(s.as_ref(), "i128", location, self.cfg.legacy_octal_numbers)?;
+        let v: i128 = scalars::signed(&self.cfg, s.as_ref(), tag, "i128", location)?;
         visitor.visit_i128(v)
     }
 
     /// Parse an unsigned 8-bit integer.
     fn deserialize_u8<V: Visitor<'de>>(mut self, visitor: V) -> Result<V::Value, Self::Error> {
         let (s, tag, location) = self.take_scalar_cow_event()?;
-        self.validate_scalar_tag(tag, SfTag::Int, "u8", location)?;
-        let v: u8 = parse_int_unsigned(s.as_ref(), "u8", location, self.cfg.legacy_octal_numbers)?;
+        let v: u8 = scalars::unsigned(&self.cfg, s.as_ref(), tag, "u8", location)?;
         visitor.visit_u8(v)
     }
     /// Parse an unsigned 16-bit integer.
     fn deserialize_u16<V: Visitor<'de>>(mut self, visitor: V) -> Result<V::Value, Self::Error> {
         let (s, tag, location) = self.take_scalar_cow_event()?;
-        self.validate_scalar_tag(tag, SfTag::Int, "u16", location)?;
-        let v: u16 =
-            parse_int_unsigned(s.as_ref(), "u16", location, self.cfg.legacy_octal_numbers)?;
+        let v: u16 = scalars::unsigned(&self.cfg, s.as_ref(), tag, "u16", location)?;
         visitor.visit_u16(v)
     }
     /// Parse an unsigned 32-bit integer.
     fn deserialize_u32<V: Visitor<'de>>(mut self, visitor: V) -> Result<V::Value, Self::Error> {
         let (s, tag, location) = self.take_scalar_cow_event()?;
-        self.validate_scalar_tag(tag, SfTag::Int, "u32", location)?;
-        let v: u32 =
-            parse_int_unsigned(s.as_ref(), "u32", location, self.cfg.legacy_octal_numbers)?;
+        let v: u32 = scalars::unsigned(&self.cfg, s.as_ref(), tag, "u32", location)?;
         visitor.visit_u32(v)
     }
     /// Parse an unsigned 64-bit integer.
     fn deserialize_u64<V: Visitor<'de>>(mut self, visitor: V) -> Result<V::Value, Self::Error> {
         let (s, tag, location) = self.take_scalar_cow_event()?;
-        self.validate_scalar_tag(tag, SfTag::Int, "u64", location)?;
-        let v: u64 =
-            parse_int_unsigned(s.as_ref(), "u64", location, self.cfg.legacy_octal_numbers)?;
+        let v: u64 = scalars::unsigned(&self.cfg, s.as_ref(), tag, "u64", location)?;
         visitor.visit_u64(v)
     }
     /// Parse an unsigned 128-bit integer.
     fn deserialize_u128<V: Visitor<'de>>(mut self, visitor: V) -> Result<V::Value, Self::Error> {
         let (s, tag, location) = self.take_scalar_cow_event()?;
-        self.validate_scalar_tag(tag, SfTag::Int, "u128", location)?;
-        let v: u128 =
-            parse_int_unsigned(s.as_ref(), "u128", location, self.cfg.legacy_octal_numbers)?;
+        let v: u128 = scalars::unsigned(&self.cfg, s.as_ref(), tag, "u128", location)?;
         visitor.visit_u128(v)
     }
 
     /// Parse a 32-bit float (supports YAML 1.2 `+.inf`, `-.inf`, `.nan`).
     fn deserialize_f32<V: Visitor<'de>>(mut self, visitor: V) -> Result<V::Value, Self::Error> {
         let (s, tag, location) = self.take_scalar_cow_event()?;
-        self.validate_scalar_tag(tag, SfTag::Float, "floating point", location)?;
-        let v: f32 = parse_yaml12_float(s.as_ref(), location, tag, self.cfg.angle_conversions)?;
+        let v = scalars::float32(&self.cfg, s.as_ref(), tag, location)?;
         visitor.visit_f32(v)
     }
     /// Parse a 64-bit float (supports YAML 1.2 `+.inf`, `-.inf`, `.nan`).
     fn deserialize_f64<V: Visitor<'de>>(mut self, visitor: V) -> Result<V::Value, Self::Error> {
         let (s, tag, location) = self.take_scalar_cow_event()?;
-        self.validate_scalar_tag(tag, SfTag::Float, "floating point", location)?;
-        let v: f64 = parse_yaml12_float(s.as_ref(), location, tag, self.cfg.angle_conversions)?;
+        let v = scalars::float64(&self.cfg, s.as_ref(), tag, location)?;
         visitor.visit_f64(v)
     }
 

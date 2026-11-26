@@ -216,6 +216,19 @@ impl SfTag {
         }
     }
 
+    /// The tag whose resolved spelling is `spelling`: the text `Tag`'s `Display` gives, as
+    /// `Tagged` reports it. A resolved tag is the same whichever way it splits into handle and
+    /// suffix.
+    pub(crate) fn from_spelling(spelling: Option<&str>) -> SfTag {
+        let tag = spelling.map(|spelling| {
+            Cow::Owned(match spelling.strip_prefix('!') {
+                Some(suffix) => Tag::new("!", suffix),
+                None => Tag::new(spelling, ""),
+            })
+        });
+        Self::from_optional_cow(&tag)
+    }
+
     /// Tags that preserve scalar text instead of allowing implicit type resolution.
     pub(crate) fn forces_string(&self) -> bool {
         matches!(self, SfTag::String | SfTag::NonSpecific)
