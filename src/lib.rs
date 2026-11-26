@@ -64,6 +64,8 @@ pub use de::robotics;
 #[cfg(all(feature = "deserialize", feature = "include_fs"))]
 pub use de::safe_resolver::{SafeFileReadMode, SafeFileResolver, SymlinkPolicy};
 #[cfg(feature = "deserialize")]
+pub use de::scalars;
+#[cfg(feature = "deserialize")]
 pub use granit_parser;
 pub use location::{Location, Locations};
 pub use long_strings::{FoldStr, FoldString, LitStr, LitString};
