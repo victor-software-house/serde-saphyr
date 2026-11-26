@@ -42,6 +42,8 @@ pub(crate) mod live_events;
 #[cfg(feature = "deserialize")]
 pub mod localizer;
 #[cfg(feature = "deserialize")]
+pub mod located;
+#[cfg(feature = "deserialize")]
 pub(crate) mod message_formatters;
 #[cfg(feature = "miette")]
 pub mod miette;

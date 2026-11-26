@@ -51,6 +51,8 @@ pub use anchors::{
 pub use de::figment;
 #[cfg(feature = "figment2")]
 pub use de::figment2;
+#[cfg(feature = "deserialize")]
+pub use de::located;
 #[cfg(feature = "miette")]
 pub use de::miette;
 #[cfg(any(feature = "garde", feature = "validator"))]

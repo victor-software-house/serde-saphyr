@@ -327,7 +327,7 @@ pub(crate) enum NodeOrigin {
 ///
 /// Ordinary events need no extra allocation. Non-direct origins are indexed separately so
 /// that buffering an ordinary container does not erase any aliases nested inside it.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(super) struct RecordedEvents<'a> {
     events: SmallVec<[Ev<'a>; 1]>,
     origins: SmallVec<[(usize, NodeOrigin); 1]>,
@@ -541,8 +541,25 @@ pub(crate) trait Events<'de> {
         None // Default: borrowing not supported
     }
 
+    /// The include chain of the source `source_id`: that source first, then the source that
+    /// included it, up to the input. Empty when the source is the input or nothing is included.
+    fn include_links(&self, _source_id: u32) -> Vec<IncludeLink> {
+        Vec::new()
+    }
+
     #[cfg(feature = "properties")]
     fn property_interpolation(&self) -> &PropertyInterpolation;
+}
+
+/// A source that another source included.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct IncludeLink {
+    /// The id of the included source.
+    pub(crate) source_id: u32,
+    /// The id of the source that holds the include, or none when it is the input.
+    pub(crate) parent_source_id: Option<u32>,
+    /// Where the include is written in the parent source.
+    pub(crate) location: Location,
 }
 
 /// Keep recursive aliases intact while buffering, including lookahead and comment hooks.

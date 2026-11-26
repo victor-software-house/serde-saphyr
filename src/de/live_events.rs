@@ -26,6 +26,8 @@ use crate::budget::{BudgetEnforcer, EnforcingPolicy};
 #[cfg(not(feature = "include"))]
 use crate::buffered_input::ReaderInput;
 
+#[cfg(feature = "include")]
+use super::events::IncludeLink;
 #[cfg(feature = "properties")]
 use super::events::PropertyInterpolation;
 use super::events::{NodeOrigin, attach_alias_locations_if_missing};
@@ -1725,6 +1727,24 @@ impl<'de> Events<'de> for LiveEvents<'de> {
         self.input
     }
 
+    #[cfg(feature = "include")]
+    fn include_links(&self, source_id: u32) -> Vec<IncludeLink> {
+        let mut id = source_id;
+        self.parser
+            .recorded_source_chain(source_id)
+            .into_iter()
+            .map(|source| {
+                let link = IncludeLink {
+                    source_id: id,
+                    parent_source_id: source.parent_source_id,
+                    location: source.include_location,
+                };
+                id = source.parent_source_id.unwrap_or_default();
+                link
+            })
+            .collect()
+    }
+
     #[cfg(feature = "properties")]
     fn property_interpolation(&self) -> &PropertyInterpolation {
         &self.property_interpolation
@@ -1734,6 +1754,12 @@ impl<'de> Events<'de> for LiveEvents<'de> {
 impl LiveEvents<'_> {
     pub(crate) fn synthesized_null_emitted(&self) -> bool {
         self.synthesized_null_emitted
+    }
+
+    /// The id of the source the input is parsed from. A node that comes from an included file
+    /// carries another id.
+    pub(crate) fn input_source_id(&self) -> u32 {
+        self.parser.current_source_id()
     }
 
     #[cfg(feature = "include")]
